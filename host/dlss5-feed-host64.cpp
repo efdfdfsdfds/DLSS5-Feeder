@@ -327,6 +327,9 @@ static void RenodxFindBanner(const char *buf, DWORD size, char *out, size_t out_
             continue;
         DWORD end = i + 4;
         while (end < size && digit(buf[end])) ++end;
+        // rhi-repo's "renodx-dlss5-4.55" tag carries a three-part banner, "v4.1.5" (#90).
+        if (end + 1 < size && buf[end] == '.' && digit(buf[end + 1]))
+            for (++end; end < size && digit(buf[end]); ++end) {}
         if (end < size && buf[end] == '\0' && end - i < out_size)
         {
             memcpy(out, buf + i, end - i);
@@ -2063,8 +2066,10 @@ static void LogHostAdapter()
             "faults inside the driver's own NGX runtime -- an access violation in D3D12Core.dll, reached "
             "through nvngx_dlssnr.dll -- so DLSS 5 delivers nothing while everything else keeps working, "
             "and there is nothing to fix on this side. Three things do work: Deep Fried Chicken as the "
-            "neural consumer, a classic-engine renodx-dlss5 build (v4.55 and the 'latest' build both pass "
-            "here), or driver 616.56. Run this helper with --test to check any combination in seconds.",
+            "neural consumer, a renodx-dlss5 build this helper does NOT report as v4.6+ (the classic build "
+            "measured here is 391168 bytes, sha256 87aef9ddd937c724...; the rhi-repo 'renodx-dlss5-4.55' "
+            "download is a different build, banner v4.1.5, with the v4.6 engine markers), or driver 616.56. "
+            "Run this helper with --test to check any combination in seconds.",
             g_renodx_v47 ? "v4.7" : "v4.6", driver);
 }
 

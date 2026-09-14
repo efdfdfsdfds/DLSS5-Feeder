@@ -183,7 +183,13 @@ static void WriteCrashDump(EXCEPTION_POINTERS *ep)
     // this file rather than fail with a sharing violation (error 32).
     HANDLE f = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f == INVALID_HANDLE_VALUE) { Log("[feed] could not create %s (error %lu)", path, GetLastError()); return; }
+    // MINIDUMP_EXCEPTION_INFORMATION is declared under pshpack4 (minidumpapiset.h): on x64 the
+    // pointer sits at offset 4. Unpacked, dbghelp read a garbage pointer and every 64-bit dump
+    // failed with 0x800703E6 (#97).
+#pragma pack(push, 4)
     struct { DWORD tid; EXCEPTION_POINTERS *ep; BOOL client; } info = { GetCurrentThreadId(), ep, FALSE };
+#pragma pack(pop)
+    static_assert(sizeof(info) == sizeof(DWORD) + sizeof(void *) + sizeof(BOOL), "must match MINIDUMP_EXCEPTION_INFORMATION");
     // MiniDumpWithIndirectlyReferencedMemory | MiniDumpWithDataSegs | MiniDumpWithHandleData
     const int type = 0x0040 | 0x0001 | 0x0004;
     const BOOL  ok  = write(GetCurrentProcess(), GetCurrentProcessId(), f, type, ep != nullptr ? &info : nullptr, nullptr, nullptr);
@@ -285,6 +291,9 @@ static void RenodxFindBanner(const char *buf, DWORD size, char *out, size_t out_
             continue;
         DWORD end = i + 4;
         while (end < size && digit(buf[end])) ++end;
+        // rhi-repo's "renodx-dlss5-4.55" tag carries a three-part banner, "v4.1.5" (#90).
+        if (end + 1 < size && buf[end] == '.' && digit(buf[end + 1]))
+            for (++end; end < size && digit(buf[end]); ++end) {}
         if (end < size && buf[end] == '\0' && end - i < out_size)
         {
             memcpy(out, buf + i, end - i);
@@ -874,7 +883,10 @@ static unsigned         g_feed_reentries = 0;
 // off-thread Present (Smooth Motion's pacer thread above all) and is the single
 // most useful line in the log when diagnosing this class of report. Called with
 // g_feed_cs held, so the counters below need no synchronization of their own.
-static void FeedThreadTrace()
+// The stop below guards a D3D11 immediate context only: the D3D12 and Vulkan paths record
+// on the command list ReShade hands to that Present, under g_feed_cs, and rebuild their
+// session when the device changes -- stopping them on a thread change was a false stop (#96).
+static void FeedThreadTrace(bool shared_immediate_context)
 {
     const DWORD tid = GetCurrentThreadId();
     if (g_feed_thread == 0)
@@ -893,7 +905,7 @@ static void FeedThreadTrace()
         // inside the driver with no module of ours on the stack. Stop rather than keep going:
         // the game renders normally without us, which is a far better outcome than a crash
         // nobody can attribute (#86).
-        if (!g_ctx_protected)
+        if (shared_immediate_context && !g_ctx_protected)
             FeedDisable("Present is arriving on more than one thread and Direct3D 11 multithread "
                         "protection could not be enabled on this device -- continuing would race the "
                         "game's own use of its immediate context");
@@ -6367,6 +6379,7 @@ static void FeedFrame12(reshade::api::effect_runtime *rt, reshade::api::command_
                 Breadcrumb("running the same-device evaluate");
                 DWORD ecode = 0;
                 NVSDK_NGX_Result re = SafeEvaluateDLSS(&ep, &ecode);
+                UINT64 submitted = 0;
                 if (ecode != 0)
                     AbortCommands();  // never execute a list NGX crashed while recording
                 else
@@ -6374,7 +6387,7 @@ static void FeedFrame12(reshade::api::effect_runtime *rt, reshade::api::command_
                     // linear -> PQ on this same list, so it is submitted with the evaluate and
                     // lands before the copy home that ReShade records next on the same queue.
                     BridgeEncodePrivate12();
-                    EndCommands();
+                    submitted = EndCommands();
                 }
 
                 if (ecode != 0)
@@ -6382,6 +6395,14 @@ static void FeedFrame12(reshade::api::effect_runtime *rt, reshade::api::command_
                     Log("[feed] evaluate raised exception 0x%08X (caught; nothing was submitted)", ecode);
                     FeedDisable("the DLSS evaluate crashed (the DLSS 5 add-on may be incompatible with this game/resolution)");
                     g.frame_ready = false;
+                }
+                else if (submitted == 0)
+                {
+                    // EndCommands already counted the failure. Output holds no result for this
+                    // frame: copying it home would show a stale image and clear the strike count,
+                    // so a list that never closes would never stop the feed (#104). The backbuffer
+                    // still holds the game's frame; the !restored path below hands it back.
+                    Log("[feed] the same-device evaluate was not submitted; keeping the game's frame");
                 }
                 else if (NVSDK_NGX_FAILED(re))
                 {
@@ -7901,7 +7922,8 @@ static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_li
     if (!g_cfg.enabled || g.disabled || g_cfg.mode == 0) return;
 
     if (!FeedEnter()) return;   // logs the dropped call, with its thread id
-    FeedThreadTrace();
+    const reshade::api::device_api api = rt->get_device()->get_api();
+    FeedThreadTrace(api != reshade::api::device_api::d3d12 && api != reshade::api::device_api::vulkan);
     FeedFrameDispatch(rt, cl, rtv);
     FeedLeave();
 }
