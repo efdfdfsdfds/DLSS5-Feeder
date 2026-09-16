@@ -34,6 +34,11 @@ HOW TO CHECK WHAT YOU DOWNLOADED
        Get-FileHash <file>          (in PowerShell)
 3. If you got a ZIP from anywhere else: delete it and run a full antivirus scan.
 
+The genuine release zips are scanned on VirusTotal; look the SHA-256 from the
+release notes up at https://www.virustotal.com/gui/ . Example, the
+1.16.0-beta.2 zip:
+    https://www.virustotal.com/gui/file/b6c2a5a5e69812a91b10edb1fc84617caef4becf163b7f87960af1a802f25e0d
+
 
 ANTIVIRUS WARNINGS ON A GENUINE FILE
 ------------------------------------

@@ -258,6 +258,11 @@ is the common shape of this report; the path names the tool that downloaded it.
 
 For a warning on a file that really came from **this** repository:
 
+- The release zips are scanned on VirusTotal. `DLSS5-Feeder-1.16.0-beta.2.zip`, for instance:
+  <https://www.virustotal.com/gui/file/b6c2a5a5e69812a91b10edb1fc84617caef4becf163b7f87960af1a802f25e0d>.
+  Look the SHA-256 printed in the release notes up there yourself; the report is for that exact
+  file, so a copy from anywhere else will not match it.
+
 - Check it against the SHA-256 published on the [release](https://github.com/jlrouzies-fr/DLSS5-Feeder/releases) you downloaded it from
   (`Get-FileHash <file>` in PowerShell). A hash that does not match means you did not get it
   from here.
