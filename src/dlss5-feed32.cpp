@@ -934,8 +934,16 @@ static UINT64   g_runtime_generation = 1;
 // late, and running out of patience there ends the session (HostLost). So: generous enough
 // that reaching it really does mean the host is not coming back, short enough that the worst
 // case is a survivable hitch rather than the indefinite freeze this replaced.
-static const DWORD kPipeHelloMs = 15000;
-static const DWORD kPipeBuildMs = 60000;
+//
+// The pipe wait used to be 15 s, and a host that loads ReShade + a consumer add-on + NGX can
+// take longer than that on a slow disk or with Defender scanning the fresh files: issue #92
+// hit "pipe never appeared" 15.0 s after "host spawned" with the host still alive and busy,
+// after which HostClose() terminated it -- which is why the host's own log ended mid-line.
+// The wait loop already returns the moment the host process exits, so a bigger budget only
+// costs anything when the host is alive and still starting, which is exactly the case to wait for.
+static const DWORD kPipeHelloMs  = 15000;
+static const DWORD kPipeAppearMs = 60000;
+static const DWORD kPipeBuildMs  = 60000;
 // This one has an ordering constraint against the HOST, and it was violated the moment the
 // host's frame backlog was bounded (#15). The host's serve loop is single-threaded: the same
 // thread that reads this pipe can sit for up to 2000 ms inside BeginCommands waiting for the
@@ -1731,6 +1739,21 @@ static void CastInput(reshade::api::effect_runtime *rt)
         PostMessageW(g_cast_hwnd, WM_MOUSEMOVE, mk, at);
         g_cast_last = { hx, hy };
     }
+    if (!g_cast_hover)
+    {
+        // Once per session: the panel's input is delivered as posted window messages to the
+        // host's window, never as raw input or focus, and the host window stays behind the
+        // game (foreground is the game). An overlay in the host that only reads raw input or
+        // insists on being the foreground window will not see any of it (#114).
+        static bool said = false;
+        if (!said)
+        {
+            said = true;
+            Log("[feed32] cast: forwarding mouse/keys as posted WM_* messages to host window %p "
+                "(foreground window %p is the game; no raw input, no focus change)",
+                g_cast_hwnd, GetForegroundWindow());
+        }
+    }
     g_cast_hover = true;
 
     // Press and release land on different frames by construction -- what ImGui needs
@@ -2253,7 +2276,8 @@ static bool HostWorkerConnect(HANDLE ev)
 
     char name[128];
     sprintf_s(name, FEED_PIPE_FMT, static_cast<unsigned long>(GetCurrentProcessId()));
-    for (int i = 0; i < 150 && g_link.pipe == nullptr; ++i)   // up to 15 s (host loads ReShade + NGX)
+    const ULONGLONG spawn_tick = GetTickCount64();
+    for (; g_link.pipe == nullptr && GetTickCount64() - spawn_tick < kPipeAppearMs;)   // host loads ReShade + consumer + NGX
     {
         // FILE_FLAG_OVERLAPPED: every transfer after this is bounded (see PipeXfer).
         HANDLE p = CreateFileA(name, GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING,
@@ -2275,7 +2299,15 @@ static bool HostWorkerConnect(HANDLE ev)
         if (WaitForSingleObject(g_link.abort_event, 100) == WAIT_OBJECT_0)
         { strcpy_s(g_link.why, "cancelled while starting"); return false; }
     }
-    if (g_link.pipe == nullptr) { strcpy_s(g_link.why, "pipe never appeared"); return false; }
+    if (g_link.pipe == nullptr)
+    {
+        // Still alive, still no pipe: name the budget, so a log reader does not take the host
+        // being killed right after this (HostClose) for the host crashing on its own.
+        sprintf_s(g_link.why, "pipe never appeared within %lu s while the host process was still running -- "
+                  "it will be terminated now, so its log stops here; look for what it was doing last",
+                  static_cast<unsigned long>(kPipeAppearMs / 1000));
+        return false;
+    }
 
     // D3D10 is deliberately absent: by the time the host hears from us the frame is
     // already on a D3D11 relay device, so it IS a D3D11 client -- same kind, same
@@ -3470,7 +3502,8 @@ static bool BuildSharedGl(UINT w, UINT h, DXGI_FORMAT bb_fmt, uint64_t rtv_handl
         Log("[feed32] D3D12 fence -> GL semaphore import: in=%s out=%s",
             g.gl_sem_in ? "OK" : "FAILED", g.gl_sem_out ? "OK" : "FAILED");
         if (g.gl_sem_in == 0 || g.gl_sem_out == 0)
-        { FeedDisable("cross-process fence import failed (see dlss5-feed.log)"); return false; }
+        { FeedDisable("cross-process fence import failed -- most often the host opened a different GPU than "
+                      "the game (multi-GPU machine, #100): force both onto the same adapter (see dlss5-feed.log)"); return false; }
     }
 
     static const DXGI_FORMAT kFmt[FEED_SLOTS] = { DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN,
@@ -3667,7 +3700,8 @@ static bool BuildSharedVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
             g.vk_sem_in  != VK_NULL_HANDLE ? "OK" : "FAILED",
             g.vk_sem_out != VK_NULL_HANDLE ? "OK" : "FAILED");
         if (g.vk_sem_in == VK_NULL_HANDLE || g.vk_sem_out == VK_NULL_HANDLE)
-        { FeedDisable("cross-process fence import failed (see dlss5-feed.log)"); return false; }
+        { FeedDisable("cross-process fence import failed -- most often the host opened a different GPU than "
+                      "the game (multi-GPU machine, #100): force both onto the same adapter (see dlss5-feed.log)"); return false; }
         // Hand them back to ReShade as api::fence handles, which is what they already are.
         g.rs_fence_in  = { FeedVkValue(g.vk_sem_in) };
         g.rs_fence_out = { FeedVkValue(g.vk_sem_out) };

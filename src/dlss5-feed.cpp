@@ -2001,6 +2001,8 @@ static bool BeginCommands()
     return true;
 }
 
+static void AbortCommands(); // Replace a command list that cannot be reset after Close fails.
+
 static UINT64 EndCommands()
 {
     // Close() reports any error hit while the list was being recorded -- a malformed
@@ -2029,6 +2031,8 @@ static UINT64 EndCommands()
         // The allocator still holds this frame's recording; retire the slot without a
         // submit so the ring does not wait on a fence value that will never be signalled.
         g.alloc_fence[g.frame_slot] = 0;
+        // Reset cannot recover a list whose Close failed; discard its recording.
+        AbortCommands();
         g.frame_slot = (g.frame_slot + 1) % Feed::kFrames;
         FeedFail("command list would not close");
         return 0;
@@ -4702,6 +4706,8 @@ static void FeedDumpDred(HRESULT removed_reason)
 
 static void ShutdownSession();   // defined below; every InitSession* unwinds through it
 
+static ID3D12Device *g_dfc_device_proxy = nullptr;
+
 static bool InitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
 {
     Breadcrumb("opening the D3D12 session");
@@ -4764,6 +4770,24 @@ static bool InitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
         HRESULT hr = FeedCreatePrivateDevice(create_device, adapter, &g.dev12);
         if (FAILED(hr) || g.dev12 == nullptr) goto fail;
         g.dev12_owned = true;
+        // DFC records private NR work on native lists. Its NGX device must also be
+        // native, otherwise NGX allocates ReShade-wrapped descriptor heaps and
+        // passes them to native SetDescriptorHeaps (D3D12Core null dereference).
+        // Keep the proxy alive until session teardown for observers holding it.
+        if (g_chicken_present)
+        {
+            // ReShade v6.8.0 source/com_utils.hpp: IID_UnwrappedObject (QueryInterface owns a reference).
+            static constexpr GUID unwrapped = { 0x7f2c9a11, 0x3b4e, 0x4d6a,
+                { 0x81, 0x2f, 0x5e, 0x9c, 0xd3, 0x7a, 0x1b, 0x42 } };
+            ID3D12Device *native = nullptr;
+            if (SUCCEEDED(g.dev12->QueryInterface(unwrapped, reinterpret_cast<void **>(&native))) && native)
+            {
+                g_dfc_device_proxy = g.dev12;
+                g.dev12 = native;
+                Log("[feed] DFC native D3D12 transport: proxy=%p native=%p; device, lists and descriptor heaps share native identity",
+                    g_dfc_device_proxy, g.dev12);
+            }
+        }
     // Debug names make the DRED breadcrumb and page-fault output identify OUR objects.
     g.dev12->SetName(L"dlss5-feed private device");
     FeedAttachInfoQueue();
@@ -4918,6 +4942,7 @@ static void ShutdownSession()
     GuideProbeShutdown();
     SafeRelease(g.queue);
     SafeRelease(g.dev12);
+    SafeRelease(g_dfc_device_proxy);
     g.session_ready = false;
     g.dev11 = nullptr;
     g.rs_queue = nullptr;

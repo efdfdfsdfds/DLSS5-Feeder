@@ -9,8 +9,10 @@
 > We got information that some **malicious** websites were making users download ZIP using similar name as this project, e.g. `DLSS5-Feeder-v0.7.0.zip.`
 > 
 > The only official release of DLSS 5 Feeder is on this GitHub, so be careful! 
+>
+> This now includes **copies of this repository on GitHub itself**: same source tree, but the README replaced by a "Download" button leading to a ZIP on a personal `github.io` page, sold as "double-click to run, it detects your game". This project has no executable installer, only a PowerShell script you can read, and the only download is <https://github.com/jlrouzies-fr/DLSS5-Feeder/releases>. If you got a ZIP anywhere else, delete it and scan your machine.
 > 
-> *Thank to NIGos for the [report](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/88).*
+> *Thank to NIGos for the [report](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/88), and to the reporter of [#115](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/115).*
 
 > ## ℹ️ Does not work with your game? Read this part
 > 
@@ -1136,6 +1138,13 @@ Preprocessor definitions on the shader (overlay → *Preprocessor definitions* �
 | `DLSS5_MV_PROVIDER` | `0` | Which provider's output to read — see [the provider table](#motion-vectors-choosing-a-provider). |
 
 ## Logs and troubleshooting
+
+**Machines with more than one GPU (32-bit games, `cross-process fence import failed`).** The
+64-bit host opens the default adapter; the game may be running on another one. D3D12 fences
+cannot be shared across adapters, so the import fails and the feed stops with that message. Force
+the game and `dlss5-feed-host64.exe` onto the same GPU (Windows Settings > Display > Graphics,
+or the NVIDIA control panel's per-program preferred GPU); a reporter fixed Racedriver GRID
+exactly this way (#100).
 
 | File | Contents |
 | --- | --- |

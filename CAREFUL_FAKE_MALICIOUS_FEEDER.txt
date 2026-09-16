@@ -1,0 +1,45 @@
+CAREFUL: FAKE, MALICIOUS COPIES OF DLSS5-FEEDER EXIST
+=====================================================
+
+The ONLY place this project is published is:
+
+    https://github.com/jlrouzies-fr/DLSS5-Feeder/releases
+
+A release there contains exactly the files listed on the release page:
+DLSS5-Feeder-<version>.zip, this notice, and AUTOMATIC_INSTALLATION_AVAILABLE.txt.
+Nothing else on the internet is a release of this project, whatever it is named.
+
+
+WHAT THE FAKES LOOK LIKE
+------------------------
+
+* Websites offering a ZIP with a name like "DLSS5-Feeder-v0.7.0.zip" (issue #88).
+
+* Copies of this repository on GitHub itself: same source tree, but the README
+  replaced by a "Download" button that leads to a ZIP hosted on a personal
+  github.io page, described as "double-click to run, it detects your game"
+  (issue #115).
+
+This project has NO executable installer. The automatic install is a
+PowerShell script (Install-DLSS5Feeder.ps1) that you can open and read before
+running it. Anything that asks you to double-click an .exe to "install DLSS 5"
+is not from here.
+
+
+HOW TO CHECK WHAT YOU DOWNLOADED
+--------------------------------
+
+1. The download came from github.com/jlrouzies-fr/DLSS5-Feeder/releases.
+2. Its SHA-256 matches the one printed on that release page:
+       Get-FileHash <file>          (in PowerShell)
+3. If you got a ZIP from anywhere else: delete it and run a full antivirus scan.
+
+
+ANTIVIRUS WARNINGS ON A GENUINE FILE
+------------------------------------
+
+If Windows Defender flags a file whose hash DOES match the release page, it is
+a false positive. Submit it at
+    https://www.microsoft.com/en-us/wdsi/filesubmission
+so it gets cleared for everyone. Details in the README, section
+"What this project actually ships, and antivirus warnings".

@@ -561,6 +561,11 @@ someone will follow them without ever learning the installer exists:
 2. The same thing, condensed, as a **blockquote at the very top of the release description**,
    above the changelog.
 
+**And, since 1.16.0-beta.3, the fake-copies warning the same way:** `CAREFUL_FAKE_MALICIOUS_FEEDER.txt`
+(repo root) as a third standalone asset, plus a one-line blockquote in the description. Fake download
+sites (#88) and lookalike GitHub repositories with a "Download" button (#115) both exist; the release
+page is where their victims eventually land. Keep the `.txt` in step with the README's top banner.
+
 Keep the `.txt` in step with the README's "Install: the automated way" section — it restates
 the switches (`-Consumer`, `-LocalFiles`, `-NoElevate`, `-Api`, …), so a change there is a
 change here.
