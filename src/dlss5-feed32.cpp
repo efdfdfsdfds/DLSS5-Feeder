@@ -314,7 +314,12 @@ struct Cfg
                            // still a shown, still a PRESENTED window -- only its z-order and extended
                            // style differ. #15 used host_window as an A/B for "does the helper's present
                            // cost anything", and both arms presented every evaluate, so it measured
-                           // nothing. Only --hide, which the add-on never passes, suppresses the window.
+                           // nothing. 2 = --hide: no window at all (no in-game panel, no host window;
+                           // the feed itself is unaffected). At 0 the add-on passes --hide BY ITSELF when
+                           // the game's swapchain is exclusive fullscreen at host start: three 32-bit
+                           // games froze the instant the helper's shown window appeared under them
+                           // (#109 Injustice, #99 Transformers, #77 Dragon Age: Origins), and the
+                           // compositor cannot draw the cast over exclusive fullscreen anyway.
     int   host_gpu_priority; // 1 = pass --gpu-priority, asking the GPU scheduler to favour the
                            // helper process. Off by default: it can starve the game it is meant to
                            // help, and it only matters where the helper is being preempted (#83,
@@ -1191,6 +1196,8 @@ static bool       g_cast_hover;           // the cursor was over the panel last 
 static bool       g_cast_captured;        // a button went down over the panel and is still held
 static bool       g_cast_placed;          // the host window was moved under the game once
 static bool       g_cast_fullscreen;      // the game's swapchain went exclusive fullscreen
+static bool       g_host_hidden;          // the host was started with --hide (host_window=2, or exclusive
+                                          // fullscreen at start): there is no window to cast from
 static POINT      g_cast_last = { -1, -1 };
 static POINT      g_cast_cursor = { -1, -1 };   // ReShade's mouse position this frame, game client coordinates
 static bool       g_cast_capture_key;     // the overlay's "Set key" is waiting for a key
@@ -1529,6 +1536,14 @@ static bool CastLayout()
 {
     HWND game = g.runtime != nullptr ? static_cast<HWND>(g.runtime->get_hwnd()) : nullptr;
     if (game == nullptr || !IsWindow(game)) { strcpy_s(g_cast_status, "no game window"); return false; }
+    if (g_host_hidden)
+    {
+        strcpy_s(g_cast_status, g_cfg.host_window == 2
+            ? "the host runs without a window (host_window=2); nothing to cast"
+            : "the host runs without a window because the game was exclusive fullscreen when it started; "
+              "switch the game to borderless and restart it for the panel");
+        return false;
+    }
 
     if (g_cast_hwnd != nullptr && !IsWindow(g_cast_hwnd)) CastHostLost();
     if (g_cast_hwnd == nullptr)
@@ -2253,9 +2268,21 @@ static bool HostWorkerConnect(HANDLE ev)
         return false;
     }
     // host_window=0: the host still makes its window (the cast needs a shown one), but as a
-    // tool window parked behind everything -- --behind; 1: its own plain window.
+    // tool window parked behind everything -- --behind; 1: its own plain window; 2: --hide.
+    //
+    // Exclusive fullscreen turns 0 into --hide. Three 32-bit games (#109, #99, #77) stopped
+    // presenting the instant the helper's tool window was shown underneath their exclusive-
+    // fullscreen swapchain, and never came back: the game side of each log ends at "host
+    // spawned" while the host side shows a healthy handshake. The cast could not have drawn
+    // over exclusive fullscreen anyway (CastLayout says so), so the window buys nothing there.
+    const bool hide = g_cfg.host_window == 2 || (g_cfg.host_window == 0 && g_cast_fullscreen);
+    g_host_hidden = hide;
+    if (hide)
+        Log("[feed32] starting the host without a window (%s): the in-game panel is unavailable this session%s",
+            g_cfg.host_window == 2 ? "host_window=2" : "the game's swapchain is exclusive fullscreen",
+            g_cfg.host_window == 2 ? "" : " -- switch the game to borderless/windowed to get it back (#109)");
     sprintf_s(cmd, "\"%s\" %lu%s%s", exe, GetCurrentProcessId(),
-              g_cfg.host_window ? "" : " --behind",
+              hide ? " --hide" : g_cfg.host_window ? "" : " --behind",
               g_cfg.host_gpu_priority ? " --gpu-priority" : "");
 
     STARTUPINFOA si = { sizeof(si) };
@@ -5190,6 +5217,22 @@ static void OnInitEffectRuntime(reshade::api::effect_runtime *rt)
 {
     if (!g_cfg.enabled) return;
     RuntimeSlot *slot = TrackRuntime(rt);
+    // A swapchain created fullscreen from the start never fires set_fullscreen_state, and the
+    // host-start decision (--hide under exclusive fullscreen, HostWorkerConnect) reads
+    // g_cast_fullscreen. Ask DXGI directly on the D3D paths; Vulkan and OpenGL have no such mode.
+    {
+        const auto api = rt->get_device()->get_api();
+        if (api == reshade::api::device_api::d3d10 || api == reshade::api::device_api::d3d11)
+        {
+            BOOL fs = FALSE;
+            auto *sc = reinterpret_cast<IDXGISwapChain *>(rt->get_native());
+            if (sc != nullptr && SUCCEEDED(sc->GetFullscreenState(&fs, nullptr)) && fs)
+            {
+                g_cast_fullscreen = true;
+                Log("[feed32] the game's swapchain is exclusive fullscreen at start");
+            }
+        }
+    }
     DetectSmoothMotion();   // a present interposer can arrive after this add-on did
     // Not in DllMain (LoadLibrary under the loader lock) and not in the exception filter
     // (ReShade refuses a LoadLibrary from there): this is what makes a dump possible.
@@ -5634,10 +5677,12 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
         ImGui::SameLine(); HelpMarker("Which corner of the game window the cast panel sits in. It used to be "
                                       "the top-right and only that. Saved as cast_anchor in dlss5-feed.cfg.");
     }
-    bool show_host_window = g_cfg.host_window != 0;
+    bool show_host_window = g_cfg.host_window == 1;
     if (ImGui::Checkbox("Show the DLSS 5 host window", &show_host_window)) { g_cfg.host_window = show_host_window ? 1 : 0; dirty = true; }
     ImGui::SameLine(); HelpMarker("The helper process's own separate window, the old way in. Not needed for the "
-                                  "in-game panel above. Takes effect when the host is next started.");
+                                  "in-game panel above. Takes effect when the host is next started. host_window=2 in "
+                                  "dlss5-feed.cfg starts the helper with no window at all; that also happens by itself "
+                                  "when the game is in exclusive fullscreen at host start (#109).");
     bool gpu_priority = g_cfg.host_gpu_priority != 0;
     if (ImGui::Checkbox("Give the helper GPU scheduling priority", &gpu_priority))
     { g_cfg.host_gpu_priority = gpu_priority ? 1 : 0; dirty = true; }
