@@ -57,7 +57,7 @@
     Check the current directory.
 
 .NOTES
-    Windows PowerShell 5.1 compatible. Read-only. See DEPLOY-DEV.md in the DLSS5-Feeder repo
+    Windows PowerShell 5.1 compatible. Read-only. See docs/DEPLOY-DEV.md in the DLSS5-Feeder repo
     for the full install runbook that these checks are derived from.
 #>
 

@@ -194,7 +194,7 @@ Across five rebuilds on DOOM 2016 — a game that works perfectly with Smooth Mo
 confirmed the feeder's work is correct and complete before the frame is handed over, that it can
 finish early enough, and that it can be made structurally identical to a normal game's frame. The
 invented frames still never carried our output. The driver simply does not read what we wrote.
-Full detail in [`PLAN-DETROIT.md`](PLAN-DETROIT.md).
+Full detail in [`docs/PLAN-DETROIT.md`](docs/PLAN-DETROIT.md).
 
 **The feeder cannot warn you about this on Vulkan.** Its Smooth Motion check looks for a file the
 driver only loads for DirectX games, so a silent log does **not** mean Smooth Motion is off. To be
@@ -340,21 +340,21 @@ it in a game that otherwise works, and the feeder cannot detect Smooth Motion on
 silent log never ruled it out here. **If you hit this: check "Smooth Motion - Debug Bars"
 (`0xB01B8B02`), and if the bars appear, turn Smooth Motion off for Vulkan.** Eight further tests
 (DLSS/NGX, renodx NR, HDR and format detection, cross-API memory coherence, queue-family
-ownership) all came back clean — full investigation in [`PLAN-DETROIT.md`](PLAN-DETROIT.md).
+ownership) all came back clean — full investigation in [`docs/PLAN-DETROIT.md`](docs/PLAN-DETROIT.md).
 
 **32-bit Vulkan (DXVK) is implemented and user-confirmed** — see the World of Warcraft 3.3.5a row
 above (issue #15). The transport is the
 same `src/feed_vk.h` the 64-bit Vulkan path uses, compiled x86, with the host creating the shared
 textures the way the OpenGL path already does; the cross-bitness half is proven end-to-end on this
 hardware by `spike\spike-vkhost64.exe` + `spike\spike-vkclient32.exe`. Treat it as untested in a
-real game until a row appears above. See [`PLAN-VULKAN32.md`](PLAN-VULKAN32.md).
+real game until a row appears above. See [`docs/PLAN-VULKAN32.md`](docs/PLAN-VULKAN32.md).
 
 **The OpenGL path is verified 32-bit-first**, which is the harder of its two halves: Worms Ultimate
 Mayhem runs the full cross-process route — the host creates the shared textures (GL memory objects
 are import-only), the game imports them raw and answers on a shared D3D12 fence. The 64-bit
 in-process OpenGL path shares that same `src/feed_gl.h` transport, is proven by
 `spike\spike-gl64.exe`, and is user-confirmed in MX Bikes (#5). See
-[The OpenGL path](#the-opengl-path) and [`PLAN-OPENGL.md`](PLAN-OPENGL.md).
+[The OpenGL path](#the-opengl-path) and [`docs/PLAN-OPENGL.md`](docs/PLAN-OPENGL.md).
 
 **This is beta software.** Expect the temporal quality of *estimated* motion vectors (some ghosting
 in fast motion, softness on thin moving geometry), and the HUD is processed along with the scene.
@@ -510,7 +510,7 @@ problem, because only `arm=0` truly takes it out of the picture.
 
 The interop is ABI 1 in 1.4.0-alpha, 1.4.4-alpha and 1.4.8-alpha alike (`FEEDER-INTEROP-v1.md` is
 byte-identical across all three). The protocol is in `src/feed_dfc.h`; the request that produced it
-is in `FEEDBACK-DFC.md`.
+is in `docs/FEEDBACK-DFC.md`.
 
 </details>
 
@@ -1363,7 +1363,7 @@ Common cases:
   upscale, which is NVIDIA's to ship. The only route to a real frame-rate win today is the game
   rendering fewer pixels: set a lower resolution in the game and let the GPU scale it to the
   panel (NVIDIA Control Panel → Adjust desktop size and position → GPU scaling); the feeder then
-  works 1:1 at that size. See `PLAN-PROXY-SWAPCHAIN.md` for what doing that in-process would take.
+  works 1:1 at that size. See `docs/PLAN-PROXY-SWAPCHAIN.md` for what doing that in-process would take.
 * **32-bit game: changing the work resolution froze the PC for a few seconds, then DLSS never
   came back and the helper window stopped responding** — the helper's log shows `feature create
   did not complete`, its `ReShade.log` shows `DXGI_ERROR_DEVICE_HUNG`, and every later rebuild
@@ -1414,7 +1414,7 @@ under `external/reshade/include` (BSD-3-Clause, Patrick Mours), as is **MinHook*
 | `build-addon32.bat` | `build\dlss5-feed.addon32` | Vulkan headers |
 | `host\build-host.bat` | `host\dlss5-feed-host64.exe` | NGX SDK |
 | `layer\build-layer.bat` | `layer\VkLayer_feed_vk.dll` and `layer\x86\VkLayer_feed_vk32.dll` (fallback for Vulkan games where the add-on's own `vkCreateDevice` hook cannot add the interop extensions; the 32-bit pair keeps its own subdirectory because the Vulkan loader tries every manifest on `VK_LAYER_PATH`) | Vulkan headers |
-| `spike\build-spike.bat` | the standalone proofs used during development: the 32↔64-bit shared-resource pair, plus `spike-gl64.exe` / `spike-gl32.exe` and `spike-vkhost64.exe` / `spike-vkclient32.exe`, which round-trip a texture and a fence between D3D12 and OpenGL / Vulkan, in-process and cross-process, and `spike-proxy-swapchain.exe`, the `IDXGISwapChain` wrapper contract behind `PLAN-PROXY-SWAPCHAIN.md` (a 960×540 "game" presented at window size through FSR 1). They need an NVIDIA GPU to *run*, none to compile. | — |
+| `spike\build-spike.bat` | the standalone proofs used during development: the 32↔64-bit shared-resource pair, plus `spike-gl64.exe` / `spike-gl32.exe` and `spike-vkhost64.exe` / `spike-vkclient32.exe`, which round-trip a texture and a fence between D3D12 and OpenGL / Vulkan, in-process and cross-process, and `spike-proxy-swapchain.exe`, the `IDXGISwapChain` wrapper contract behind `docs/PLAN-PROXY-SWAPCHAIN.md` (a 960×540 "game" presented at window size through FSR 1). They need an NVIDIA GPU to *run*, none to compile. | — |
 
 NGX links against the Release CRT, so the builds use `/MD`.
 
@@ -1460,11 +1460,11 @@ swapchain, so nothing in the table under [Status](#status) can be verified there
   over its DLSS, XeSS and FSR backends); in-game rows land in [Status](#status) as they are run.
   With OptiScaler in the process, a game that has DLSS of its own gets *that* captured too — this
   project is for games without DLSS, and the add-on says so when it sees Streamline.
-* The **32-bit and D3D9 paths are beta** — see [`PLAN-32BIT.md`](PLAN-32BIT.md) for the full design
+* The **32-bit and D3D9 paths are beta** — see [`docs/PLAN-32BIT.md`](docs/PLAN-32BIT.md) for the full design
   and known risks. Cross-process adds a small amount of scheduling jitter versus the in-process
   64-bit path (not measured as a problem so far).
 * **32-bit Vulkan has not run in a real game yet** — the cross-bitness interop is proven by the
-  spike pair, but nothing above it is. See [`PLAN-VULKAN32.md`](PLAN-VULKAN32.md).
+  spike pair, but nothing above it is. See [`docs/PLAN-VULKAN32.md`](docs/PLAN-VULKAN32.md).
 
 ## Credits
 

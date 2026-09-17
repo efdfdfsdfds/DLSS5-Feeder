@@ -581,7 +581,7 @@ static void DetectToolkitAddon()
 // Deep Fried Chicken (deep-fried-chicken.addon64) -- an alternative neural consumer.
 // Like the DLSS 5 add-on it detours the NGX feature-1 entry points and runs its own
 // neural passes on whatever contract it finds there; unlike it, 1.4.0+ negotiates
-// with a feeder instead of fighting it (see feed_dfc.h and FEEDBACK-DFC.md):
+// with a feeder instead of fighting it (see feed_dfc.h and docs/FEEDBACK-DFC.md):
 //
 //  - it exports DFC_FeederInteropAbi / DFC_Feature1InterceptionState so we can tell
 //    whether it is armed for feature-1 work in this process;
@@ -817,7 +817,7 @@ static bool DetectSmoothMotion()
 //
 // R10G10B10A2_UNORM is legitimately either 10-bit SDR or HDR10, so the DXGI format alone
 // cannot tell them apart -- and asking only the format is why every HDR10 title was handed
-// to the neural consumer described as SDR. PLAN-DETROIT.md recorded that as a real bug and
+// to the neural consumer described as SDR. docs/PLAN-DETROIT.md recorded that as a real bug and
 // it was never fixed; it is what breaks highlights under OptiScaler DLSS-NR, which reads
 // our contract and then composes in the transfer function it was told about.
 //
@@ -4495,7 +4495,7 @@ static void FeedNgxMatrix(PFN_D3D12CreateDevice_ create_device, IUnknown *game_a
     // Leave DRED as the session expects to find it; the opener arms it again either way.
     FeedEnableDred();
     Log("[feed] ===== NGX matrix done. A row that says Init 0x00000001 (Success) is the combination "
-        "this machine wants; see DIAGNOSE-47.md for what to do with each outcome. =====");
+        "this machine wants; see docs/DIAGNOSE-47.md for what to do with each outcome. =====");
     // Honest about what this costs. The devices are gone, but the NGX SDK is per-PROCESS and has
     // now resolved its implementation and been initialised and shut down several times over. That
     // is not expected to disturb the session opened next, and does not here -- but it is not
@@ -8652,7 +8652,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
             g_ngx_matrix = GetEnvironmentVariableA("DLSS5_FEED_NGX_MATRIX", mopt, sizeof(mopt)) != 0 && mopt[0] == '1';
             if (g_ngx_matrix)
                 Log("[feed] DLSS5_FEED_NGX_MATRIX=1: the issue #47 A/B will run once at session open "
-                    "(throwaway devices; the session itself is unchanged). See DIAGNOSE-47.md.");
+                    "(throwaway devices; the session itself is unchanged). See docs/DIAGNOSE-47.md.");
         }
         {
             wchar_t exe[MAX_PATH] = {};

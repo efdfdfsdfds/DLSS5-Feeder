@@ -62,7 +62,7 @@ What that split looks like in practice:
 - **Testing is genuinely shared.** The interop spikes, the probes, the overlay diagnostics and the
   CI are Claude's. Running the games, reading what actually reached the screen and catching the
   regressions is the author's, and that is the half that has reliably found the faults.
-- **`deployment: pair`** — the build scripts, the CI and `DEPLOY-DEV.md` are AI-written; the
+- **`deployment: pair`** — the build scripts, the CI and `docs/DEPLOY-DEV.md` are AI-written; the
   builds, the installs into each game and the releases are run and verified by the author.
 
 The standing rule this project works by: **a clean log from instrumentation the AI just wrote is
@@ -86,7 +86,7 @@ tool.** The cases behind it:
   chain runs. The test shader written to settle it was itself misread on its first run (a
   saturating tint is invisible on a bright centre, and a one-frame alternating marker looks steady
   at 100+ fps). The AI's own instrument lied twice before it told the truth. See
-  [`PLAN-DETROIT.md`](PLAN-DETROIT.md).
+  [`docs/PLAN-DETROIT.md`](docs/PLAN-DETROIT.md).
 
 This repository is code, shaders and documentation. **Nothing in it is generated media** — there
 is no art, no audio, no synthesised asset of any kind. `external/` holds third-party headers and

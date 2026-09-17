@@ -2,7 +2,7 @@
 //
 // Deep Fried Chicken (deep-fried-chicken.addon64, 1.4.0+) is a neural consumer that
 // detours the NGX feature-1 entry points, like the DLSS 5 add-on does. Its author
-// implemented the compatibility surface asked for in FEEDBACK-DFC.md; the producer
+// implemented the compatibility surface asked for in docs/FEEDBACK-DFC.md; the producer
 // contract is external/deepfried/FEEDER-INTEROP-v1.md. It is a protocol, not a
 // dependency: neither side loads or embeds the other.
 //

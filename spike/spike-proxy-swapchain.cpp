@@ -6,7 +6,7 @@
 // before the real Present. ResizeBuffers() re-fits the real chain to the window and keeps
 // the private one at the size the game asked for.
 //
-// It answers the contract question in PLAN-PROXY-SWAPCHAIN.md -- can an in-process COM
+// It answers the contract question in docs/PLAN-PROXY-SWAPCHAIN.md -- can an in-process COM
 // wrapper make a D3D11 app render fewer pixels than it presents, with the app none the
 // wiser -- without ReShade, NvPresent or a real game in the process. PASS = the frames
 // reach the display through the wrapper, the readback sees the pattern, and a window

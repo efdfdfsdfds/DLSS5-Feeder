@@ -213,7 +213,7 @@ static VkSemaphore FeedVkImportFence(FeedVk *vk, HANDLE d3d12_fence_handle)
 // image of its own; the two can disagree, and the OpenGL path has always passed the D3D12
 // figure (FeedGlImportImage). Pass 0 to keep the old behaviour.
 //
-// Found while investigating the FP16 device removal documented in FP16-DEVICE-REMOVAL.md.
+// Found while investigating the FP16 device removal documented in docs/FP16-DEVICE-REMOVAL.md.
 // It was NOT the cause of that -- the cause was a hardcoded row pitch in the staleness
 // probe -- and changing this alone fixed nothing. It is committed because it is the
 // correct thing to pass, not because it fixed a bug.
