@@ -1,4 +1,4 @@
-![DLSS5 Feeder](dlss5-feeder-logo-dark.png)
+![DLSS5 Feeder](docs/images/dlss5-feeder-logo-dark.png)
 
 [![AI-DECLARATION: copilot](https://img.shields.io/badge/䷼%20AI--DECLARATION-copilot-fee2e2?labelColor=fee2e2)](AI-DECLARATION.md) [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-ffdd00?logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/jlrouzies)
 
@@ -385,7 +385,7 @@ in fast motion, softness on thin moving geometry), and the HUD is processed alon
   ```
 - Confirm the executable it proposes.
 
-![Installer](dlss5-feeder-install-script.png)
+![Installer](docs/images/dlss5-feeder-install-script.png)
 
 Or point it at the exe from anywhere:
 
@@ -634,7 +634,7 @@ work. Two folders to fill:
   saved as `WindowWidth` / `WindowHeight` under `[DLSS5Host]` in `host64\ReShade.ini` (a different
   file from `dlss5-feed.cfg`, because it is the helper's own ReShade that reads them at startup).
 
-![32-bit-overlay-ingame](Ingame-32bit-overlay.png)
+![32-bit-overlay-ingame](docs/images/Ingame-32bit-overlay.png)
 
 The helper's own window, with `host_window=1`:
 
