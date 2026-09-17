@@ -107,11 +107,11 @@ jobs:
       # ------------------------------------------------------------------
       - name: dlss5-feed.addon64 (64-bit add-on -- D3D11/D3D12/Vulkan/OpenGL + NGX)
         shell: cmd
-        run: call build.bat
+        run: call tools\build.bat
 
       - name: dlss5-feed.addon32 (32-bit in-game half -- D3D11/OpenGL/Vulkan)
         shell: cmd
-        run: call build-addon32.bat
+        run: call tools\build-addon32.bat
 
       - name: dlss5-feed-host64.exe (64-bit NGX host for 32-bit games)
         shell: cmd

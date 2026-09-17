@@ -2,7 +2,7 @@
 
 This add-on links NVIDIA's NGX SDK, which is **not redistributed** in this repository.
 
-To build, drop the NGX SDK here so the paths match `build.bat`:
+To build, drop the NGX SDK here so the paths match `tools\build.bat`:
 
 ```
 external/ngx/nvsdk_ngx.h

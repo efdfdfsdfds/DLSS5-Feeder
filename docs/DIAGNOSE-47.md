@@ -126,7 +126,7 @@ the failure:
 > 2. Work out which of the three variables (adapter argument, DRED arming, feature level)
 >    separates the successful rows from the failing ones, using the table in section 2.
 > 3. Make the corresponding change in `src/dlss5-feed.cpp` — `FeedCreatePrivateDevice` and
->    `InitSession` are the relevant functions — build with `build.bat`, and have me retest.
+>    `InitSession` are the relevant functions — build with `tools\build.bat`, and have me retest.
 >    Iterate until NGX initialises in-process.
 > 4. If no combination succeeds, work through section 3 instead: identify what else in the
 >    process is hooking NGX, and confirm against `dlss5-feed-host64.exe --test --hide` as the

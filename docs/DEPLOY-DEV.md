@@ -64,8 +64,8 @@ deploy/
 older than the working tree:
 
 ```
-build.bat                 # -> build\dlss5-feed.addon64   (64-bit in-game/D3D/Vulkan add-on)
-build-addon32.bat         # -> build\dlss5-feed.addon32   (32-bit in-game stub)
+tools\build.bat           # -> build\dlss5-feed.addon64   (64-bit in-game/D3D/Vulkan add-on)
+tools\build-addon32.bat   # -> build\dlss5-feed.addon32   (32-bit in-game stub)
 host\build-host.bat       # -> host\dlss5-feed-host64.exe (64-bit helper for the 32-bit path)
 layer\build-layer.bat     # -> layer\VkLayer_feed_vk.dll  (out-of-process Vulkan fallback)
 ```
