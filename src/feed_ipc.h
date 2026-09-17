@@ -93,6 +93,10 @@
 #define FEED_ACK_SR_ACTIVE       1u   // the feature is DLSS Super Resolution work -> target (sr_quality says which preset)
 #define FEED_ACK_SR_UNAVAILABLE  2u   // SR was asked for, no preset covers the ratio: the build failed on purpose,
                                       // rebuild with target == work (DLAA)
+#define FEED_ACK_MGPU_FRAMES     4u   // MGPU Bridge is the helper's only consumer: its window now carries the game's
+                                      // frames (one present per evaluate) for MGPU to capture, so there is no panel
+                                      // to cast and nothing neural comes home. An unset bit is the old behaviour on
+                                      // both sides, so this needs no FEED_IPC_VERSION bump.
 #define FEED_PIPE_FMT    "\\\\.\\pipe\\dlss5-feed.%lu"   // %lu = game PID
 
 // The bytes a version-1 client sends as its hello: magic, version, pid.

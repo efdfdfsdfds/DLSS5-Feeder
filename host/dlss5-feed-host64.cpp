@@ -41,6 +41,11 @@
 #include "../src/feed_fmt.h"
 #include "../src/feed_dfc.h"   // Deep Fried Chicken interop ABI 1 (producer side, HostMode=1 here)
 #include "../src/feed_opti.h"  // OptiScaler DLSS-NR as the consumer: detection and the two fingerprints
+#include "../src/feed_mgpu.h"  // MGPU Bridge (second-GPU neural rendering) as the consumer: layout and ini checks
+
+// In MGPU mode only, this exe registers ITSELF with the ReShade it loaded, as an add-on: that is
+// the one way to bind the DEPTH semantic MGPU's tap reads, and to count the events MGPU lives on.
+#include <reshade.hpp>
 
 #ifndef FEED_BUILD_ID
 #define FEED_BUILD_ID "unknown"
@@ -80,6 +85,10 @@ static UINT g_overlay_key = VK_HOME;
 // (see InitDisguise). False means there is no ReShade runtime here at all, so the overlay
 // key is dead and the banner must not send the user after it.
 static bool g_reshade_hooked = false;
+// --adapter-luid=HHHHHHHH:LLLLLLLL from the add-on: the adapter the GAME's device is on.
+static bool g_want_luid = false;
+static LUID g_game_luid = {};
+static bool g_on_game_adapter = false;
 static int  g_pump_count  = 0;
 // The pump at which to post the overlay key, and again three pumps later. Startup opens the
 // overlay once at 90; tag 'O' (v9) re-arms it so the add-on's button can bring it back.
@@ -753,6 +762,107 @@ static void DetectOptiScaler()
             toolkit_present ? "alexs-toolkit.addon64 " : "");
 }
 
+// MGPU Bridge beside this exe -- the fourth neural consumer, and the one that changes what this
+// process IS (see feed_mgpu.h; mirrors the section in src/dlss5-feed.cpp). For every other
+// consumer this helper is a disguise: a D3D12 "game" whose picture nobody looks at, because the
+// neural pass runs inside our NGX call and its result goes home through the shared Output. MGPU
+// does not work that way. It wants a D3D12 game's FRAME: colour from the back buffer at
+// reshade_finish_effects, depth from ReShade's DEPTH semantic, vectors from the evaluate. So in
+// MGPU mode the disguise becomes the real thing -- the swapchain is resized to the game's
+// resolution and format, every evaluate's output is copied into it and presented exactly once,
+// and the Depth slot is bound as DEPTH on this window's effect runtime.
+//
+// Only when MGPU is the ONLY consumer here. With another one beside it nothing changes (and the
+// log says why): that consumer's per-Present bookkeeping is what the banner path was tuned for.
+//
+// ALPHA, unverified end to end: MGPU refuses to arm without a second neural-capable GPU.
+static MgpuInfo g_mgpu;
+static bool     g_mgpu_mode;                 // the swapchain carries the game's frames
+static bool     g_mgpu_force;                // --mgpu-frames: frame mode without MGPU present (rig)
+static bool     g_mgpu_sim;                  // --mgpu-sim: record MGPU's own barrier + copy before each evaluate (rig)
+static bool     g_mgpu_latch_clear = true;   // [DLSS5Host] MgpuLatchClear
+static int      g_mgpu_creates;
+
+static void HostWarn(const char *fmt, ...)
+{
+    char line[1900];
+    va_list ap;
+    va_start(ap, fmt);
+    _vsnprintf_s(line, sizeof(line), _TRUNCATE, fmt, ap);
+    va_end(ap);
+    Log("[host] WARNING: %s", line);
+}
+
+static void DetectMgpuBridge()
+{
+    char dir[MAX_PATH];
+    GetModuleFileNameA(nullptr, dir, MAX_PATH);
+    if (char *sl = strrchr(dir, '\\')) *(sl + 1) = '\0';
+
+    if (!MgpuScan(dir, dir, &g_mgpu))
+    {
+        Log("[host] MGPU Bridge: not present");
+        if (g_mgpu_force) { g_mgpu_mode = true; Log("[host] --mgpu-frames: frame mode forced on without it"); }
+        return;
+    }
+    MgpuReportLayout(g_mgpu, "host", "in host64", &Log, &HostWarn);
+
+    char toolkit[MAX_PATH];
+    sprintf_s(toolkit, "%salexs-toolkit.addon64", dir);
+    const bool toolkit_present = GetFileAttributesA(toolkit) != INVALID_FILE_ATTRIBUTES;
+    if (g_chicken_present || g_renodx_present || g_opti.present || toolkit_present)
+    {
+        HostWarn("%s%s%s%sis ALSO in host64 beside MGPU Bridge. That consumer runs the neural model on this GPU, inside "
+                 "this helper's NGX call; MGPU would run it again on the second GPU. They also disagree about where "
+                 "nvngx_dlssnr.dll must be (beside this exe for that one, in mgpu\\ for MGPU). This helper stays in its "
+                 "ordinary mode -- MGPU gets motion vectors but no frame and no depth, so it shows nothing useful. Keep "
+                 "exactly one: remove the other consumer's files, or MGPU's, then restart the game.",
+                 g_chicken_present ? "Deep Fried Chicken " : "", g_renodx_present ? "renodx-dlss5.addon64 " : "",
+                 g_opti.present ? "OptiScaler " : "", toolkit_present ? "alexs-toolkit.addon64 " : "");
+        return;
+    }
+    g_mgpu_mode = true;
+
+    char ini[MAX_PATH];
+    HostIniPath(ini, sizeof(ini));
+    g_mgpu_latch_clear = GetPrivateProfileIntA("DLSS5Host", "MgpuLatchClear", 1, ini) != 0;
+    Log("[host] %s is the neural consumer (ALPHA -- this pairing has never been run end to end; it needs two RTX GPUs). "
+        "This window becomes the game's frame: each evaluate's output is copied into the swapchain at the game's "
+        "resolution and presented once, the Depth slot is bound as ReShade's DEPTH semantic here, and MGPU copies the "
+        "motion vectors out of the evaluate. Its picture is in ITS window, on the second GPU's display. No warm-up "
+        "re-create: MGPU can latch %d feature handles per process. [DLSS5Host] MgpuLatchClear=%d",
+        MGPU_LABEL, MGPU_HANDLE_SLOTS, g_mgpu_latch_clear ? 1 : 0);
+
+    // MGPU's tap has to be compiled by THIS window's runtime, or reshade_finish_effects never fires
+    // here (ReShade renders no effects pass at all with zero techniques) and MGPU never sees a frame.
+    // This helper's ReShade.ini is ours to edit, and ReShade has not loaded yet.
+    char fx_here[MAX_PATH], fx_pack[MAX_PATH], paths[2048] = {};
+    sprintf_s(fx_here, "%s" MGPU_TAP_FX, dir);
+    sprintf_s(fx_pack, "%sreshade-shaders\\Shaders\\" MGPU_TAP_FX, dir);
+    GetPrivateProfileStringA("GENERAL", "EffectSearchPaths", "", paths, sizeof(paths), ini);
+    if (MgpuFileExists(fx_here))
+    {
+        if (strstr(paths, ".\\") == nullptr)
+            HostWarn(MGPU_TAP_FX " is in host64, but EffectSearchPaths in host64\\ReShade.ini (%s) does not include .\\ -- "
+                     "ReShade will not compile it and MGPU will never see a frame.", paths);
+    }
+    else if (MgpuFileExists(fx_pack))
+    {
+        if (!MgpuContainsNoCase(paths, "reshade-shaders"))
+        {
+            char more[2200];
+            sprintf_s(more, "%s%s.\\reshade-shaders\\Shaders", paths, paths[0] != '\0' ? "," : "");
+            WritePrivateProfileStringA("GENERAL", "EffectSearchPaths", more, ini);
+            Log("[host] ReShade.ini: added .\\reshade-shaders\\Shaders to EffectSearchPaths so this window's runtime "
+                "compiles " MGPU_TAP_FX);
+        }
+    }
+    else
+        HostWarn(MGPU_TAP_FX " is not in host64 (nor in host64\\reshade-shaders\\Shaders). Without it this window's "
+                 "ReShade runs no effects pass, MGPU's colour capture never fires, and its depth never binds (its "
+                 "ERROR 204). Copy it from MGPU's release zip into host64.");
+}
+
 static void Log(const char *fmt, ...)
 {
     char line[2048];
@@ -1037,6 +1147,7 @@ struct HostFault
 };
 static HostFault g_ngx_fault;
 static __int64 g_reshade_log_start;
+static void FrameModeReport(const char *when);   // defined with MGPU frame mode, below
 
 static bool ContainsNoCase(const char *hay, const char *needle)
 {
@@ -1087,6 +1198,22 @@ static void LogNeuralConsumerOutcome()
     fclose(f);
 
     const char *log = data.data();
+    if (g_mgpu_mode && g_mgpu.present)
+    {
+        // MGPU's neural model lives on the other GPU and says nothing about feature 18 here. What
+        // this side CAN read is whether its calibrator saw our create and is copying our vectors.
+        const bool saw_create = ContainsNoCase(log, "[MGPU][R134] GAME CreateFeature: id=1");
+        const bool refused    = ContainsNoCase(log, "[MGPU][T2] REFUSING");
+        const bool install    = ContainsNoCase(log, "INSTALL PROBLEM");
+        unsigned long long copies = 0;
+        for (const char *q = log; (q = strstr(q, "eval-copies=")) != nullptr; q += 12) copies = strtoull(q + 12, nullptr, 10);
+        Log("[host] neural consumer outcome: MGPU Bridge %s this helper's feature create; its last report counts %llu "
+            "vector copies taken from these evaluates%s%s", saw_create ? "saw" : "did NOT see", copies,
+            refused ? "; it REFUSED to select a second adapter ([MGPU][T2] in ReShade.log says why) -- nothing runs on a second GPU"
+                    : "", install ? "; it reports INSTALL PROBLEM (nvngx_dlssnr.dll beside this exe)" : "");
+        FrameModeReport("300 evaluates in");
+        return;
+    }
     const bool feature18 = ContainsNoCase(log, "feature 18") || ContainsNoCase(log, "DLSSD");
     const bool evaluated = ContainsNoCase(log, "evaluation succeeded") ||
                            ContainsNoCase(log, "feature 18 evaluated") ||
@@ -1113,7 +1240,8 @@ static int NoteNgxFault(EXCEPTION_POINTERS *ep)
     g_ngx_fault.via_consumer = ContainsNoCase(g_ngx_fault.stack, g_renodx_file) ||
                                ContainsNoCase(g_ngx_fault.stack, DFC_ADDON_FILENAME) ||
                                ContainsNoCase(g_ngx_fault.stack, g_opti.module) ||
-                               ContainsNoCase(g_ngx_fault.stack, OPTI_FORWARDER);
+                               ContainsNoCase(g_ngx_fault.stack, OPTI_FORWARDER) ||
+                               (g_mgpu.present && ContainsNoCase(g_ngx_fault.stack, g_mgpu.addon));   // its hooks wrap every evaluate
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
@@ -1191,6 +1319,11 @@ static NVSDK_NGX_Result SafeCreateDLSS(NVSDK_NGX_DLSS_Create_Params *cp, DWORD *
     ChickenPoll();
     g_chicken_created_unarmed = g_chicken_present && g_chicken_state != DFC_STATE_ARMED;
     PublishDfcInterop();
+    if (g_mgpu.present && ++g_mgpu_creates == MGPU_HANDLE_SLOTS + 1)
+        HostWarn("this is feature create number %d in this helper. MGPU Bridge latches the first %d scene-feature handles "
+                 "it sees and never releases one; unless NGX reuses an old handle's address its filter now skips this "
+                 "feature's evaluates (eval-skips climbs on its [R101] line) and its motion vectors freeze. Resolution "
+                 "changes are what cost creates. Restart the game to get them back.", g_mgpu_creates, MGPU_HANDLE_SLOTS);
     __try { return NGX_D3D12_CREATE_DLSS_EXT(h.list, 1, 1, &h.feature, h.params, cp); }
     __except (NoteNgxFault(GetExceptionInformation())) { *code = g_ngx_fault.code; return static_cast<NVSDK_NGX_Result>(0x7FFFFFFF); }
 }
@@ -1216,6 +1349,8 @@ static void SafeReleaseFeature(NVSDK_NGX_Handle *f)
 // ---------------------------------------------------------------------------
 
 static bool HostResize(int new_w, int new_h, const char *why);   // defined with the swapchain
+static bool g_frame_mode;                // MGPU frame mode (defined with it, below): the swapchain is the game's frame
+static UINT g_bb_w, g_bb_h;
 static bool g_sizing;                    // inside a border drag: WM_SIZE is coalesced until it ends
 static int  g_sizing_w, g_sizing_h;
 
@@ -1450,6 +1585,15 @@ static bool HostResize(int new_w, int new_h, const char *why)
     new_w &= ~1; new_h &= ~1;
     if (new_w == g_win_w && new_h == g_win_h) return false;
     if (h.swap == nullptr) { g_win_w = new_w; g_win_h = new_h; return true; }   // before InitDisguise
+    if (g_frame_mode)
+    {
+        // The buffers are the GAME's size now and only a build changes them; DXGI scales them
+        // into whatever the window is. Remember the size and leave the swapchain alone.
+        Log("[host] window resized from %dx%d to %dx%d (%s); frame mode keeps the swapchain at %ux%u", g_win_w, g_win_h,
+            new_w, new_h, why, g_bb_w, g_bb_h);
+        g_win_w = new_w; g_win_h = new_h;
+        return true;
+    }
 
     Log("[host] resizing the window from %dx%d to %dx%d (%s)", g_win_w, g_win_h, new_w, new_h, why);
 
@@ -1531,6 +1675,7 @@ static bool HostResize(int new_w, int new_h, const char *why)
 static void CopyPanel()
 {
     if (h.panel == nullptr || g_panel_list == nullptr || g_swap3 == nullptr) return;
+    if (g_frame_mode) return;   // the buffers are the game's frame, not the panel's size
     if (g_panel_fence->GetCompletedValue() < g_panel_val) return;   // the last copy is still running
     DXGI_SWAP_CHAIN_DESC sd = {};
     if (FAILED(g_swap3->GetDesc(&sd)) || sd.BufferCount == 0) return;
@@ -1555,6 +1700,347 @@ static void CopyPanel()
         h.pump_queue->Signal(g_panel_fence, ++g_panel_val);
     }
     bb->Release();
+}
+
+// ---------------------------------------------------------------------------
+// MGPU frame mode (see DetectMgpuBridge): this window's swapchain carries the game's frames.
+//
+// Sequencing, which is the whole point. The evaluate runs on h.queue; the swapchain belongs to
+// h.pump_queue. For each evaluate: pump_queue waits (GPU-side, never the CPU) for the evaluate's
+// fence, copies the Output into the current back buffer, and Present runs ReShade's hook on that
+// same queue -- effects (MGPU's depth tap), reshade_finish_effects (MGPU's colour capture), then
+// the present event. So MGPU sees colour, depth and vectors of the SAME frame, in that order.
+//
+// h.queue never waits on pump_queue. A window DWM is not compositing can hold the pump queue
+// inside DXGI's present-wait (see HostResize), and the game is waiting on h.queue.
+// ---------------------------------------------------------------------------
+// g_frame_mode (entered on the first successful build, never left) and g_bb_w/g_bb_h (the
+// swapchain buffer size in frame mode; the WINDOW stays g_win_w x g_win_h) are declared above
+// HostResize, which needs them first.
+static bool        g_fm_ok;                 // this build's Output can be copied into the back buffer
+static DXGI_FORMAT g_bb_fmt = DXGI_FORMAT_R8G8B8A8_UNORM;
+static ID3D12Resource            *g_fm_src;            // what is copied: the shared Output (--test: its output texture)
+static ID3D12CommandAllocator    *g_fm_alloc[3];
+static UINT64                     g_fm_alloc_val[3];
+static ID3D12GraphicsCommandList *g_fm_list;
+static ID3D12Fence               *g_fm_fence;
+static UINT64                     g_fm_val;
+static int                        g_fm_slot;
+static bool                       g_fm_latched;        // the last Present said WAS_STILL_DRAWING: ReShade will skip its next hook
+static UINT64                     g_last_eval_fence;   // h.fence value of the newest evaluate
+static ID3D12Resource            *g_mgpu_depth;        // private copy of the Depth slot, stable across the game's next write
+static ID3D12Resource            *g_mgpu_sim_tex;      // --mgpu-sim: where the simulated vector copy lands
+static unsigned long long g_fm_evals, g_fm_presents, g_fm_still, g_fm_no_slot, g_fm_failed;
+
+// The ReShade side. Events for THIS window's runtime arrive on this process's one thread, inside
+// Present; MGPU's own runtime (its GPU-1 window) raises the same events on MGPU's thread, so
+// every callback first checks whose runtime it was handed.
+static bool                          g_rs_registered;
+static reshade::api::effect_runtime *g_rs_runtime;
+static reshade::api::resource_view   g_rs_depth_srv;
+static bool                          g_rs_overlay_open;
+static volatile LONG                 g_rs_presents, g_rs_finishes;
+static size_t                        g_rs_techniques;   // how many techniques this window's runtime has (0 = no effects pass)
+
+static bool RsIsOurs(reshade::api::effect_runtime *rt)
+{
+    return rt != nullptr && h.hwnd != nullptr && static_cast<HWND>(rt->get_hwnd()) == h.hwnd;
+}
+
+// Bind (or re-bind) the DEPTH semantic on this window's runtime to the private depth copy.
+// ReShade keeps a semantic binding across effect reloads, but its built-in Generic Depth add-on
+// erases DEPTH whenever it has no depth-stencil to offer -- always, here -- on every reload. It
+// registered first, so its callback runs first and this one has the last word.
+static void RsBindDepth(const char *why)
+{
+    if (!g_rs_registered || g_rs_runtime == nullptr || g_mgpu_depth == nullptr) return;
+    reshade::api::device *dev = g_rs_runtime->get_device();
+    if (g_rs_depth_srv.handle == 0)
+    {
+        const reshade::api::resource res = { reinterpret_cast<uint64_t>(g_mgpu_depth) };
+        if (!dev->create_resource_view(res, reshade::api::resource_usage::shader_resource,
+                                       reshade::api::resource_view_desc(reshade::api::format::r32_float), &g_rs_depth_srv))
+        {
+            g_rs_depth_srv = {};
+            Log("[host] WARNING: ReShade could not create a view on the depth copy; MGPU's tap will read an empty DEPTH. "
+                "Set Depth=0 in host64\\mgpu.ini to let it arm without depth (this helper never edits that file).");
+            return;
+        }
+    }
+    g_rs_runtime->update_texture_bindings("DEPTH", g_rs_depth_srv, g_rs_depth_srv);
+    static int said = 0;
+    if (++said <= 4) Log("[host] DEPTH semantic bound to the Depth slot's copy on this window's runtime (%s)", why);
+}
+
+static void RsUnbindDepth()
+{
+    if (g_rs_depth_srv.handle == 0) return;
+    if (g_rs_runtime != nullptr)
+    {
+        g_rs_runtime->update_texture_bindings("DEPTH", reshade::api::resource_view{ 0 }, reshade::api::resource_view{ 0 });
+        g_rs_runtime->get_device()->destroy_resource_view(g_rs_depth_srv);
+    }
+    g_rs_depth_srv = {};
+}
+
+static void RsCountTechniques(reshade::api::effect_runtime *rt)
+{
+    size_t n = 0;
+    rt->enumerate_techniques(nullptr, [&n](reshade::api::effect_runtime *, reshade::api::effect_technique) { ++n; });
+    g_rs_techniques = n;
+}
+
+static void RsOnInitRuntime(reshade::api::effect_runtime *rt)
+{
+    if (!RsIsOurs(rt)) return;
+    g_rs_runtime = rt;
+    RsBindDepth("runtime initialised");
+}
+static void RsOnDestroyRuntime(reshade::api::effect_runtime *rt)
+{
+    // The view belongs to the DEVICE, which outlives the runtime (ResizeBuffers recreates it).
+    if (rt == g_rs_runtime) g_rs_runtime = nullptr;
+}
+static void RsOnReloaded(reshade::api::effect_runtime *rt)
+{
+    if (rt != g_rs_runtime) return;
+    RsCountTechniques(rt);
+    Log("[host] this window's ReShade runtime loaded %llu technique%s%s", (unsigned long long)g_rs_techniques,
+        g_rs_techniques == 1 ? "" : "s",
+        g_rs_techniques == 0 ? " (none yet: ReShade compiles in the background and raises this again when it is done)" : "");
+    RsBindDepth("effects reloaded");
+}
+static bool RsOnOpenOverlay(reshade::api::effect_runtime *rt, bool open, reshade::api::input_source)
+{
+    if (rt == g_rs_runtime) g_rs_overlay_open = open;
+    return false;
+}
+static void RsOnPresent(reshade::api::effect_runtime *rt) { if (rt == g_rs_runtime) InterlockedIncrement(&g_rs_presents); }
+static void RsOnFinishEffects(reshade::api::effect_runtime *rt, reshade::api::command_list *, reshade::api::resource_view,
+                              reshade::api::resource_view)
+{
+    if (rt == g_rs_runtime) InterlockedIncrement(&g_rs_finishes);
+}
+
+// After D3D12CreateDevice (ReShade's built-in add-ons exist by then, so ours sorts after them)
+// and before the swapchain (so init_effect_runtime for it reaches us).
+static void RsRegister()
+{
+    if (!g_mgpu_mode || !g_reshade_hooked) return;
+    if (!reshade::register_addon(GetModuleHandleW(nullptr)))
+    {
+        Log("[host] WARNING: ReShade refused this helper as an add-on (its API is older than %d, or add-on support is "
+            "off in this build). MGPU's depth cannot be bound from here: set Depth=0 in host64\\mgpu.ini to let it arm "
+            "without depth. Colour and motion vectors are unaffected.", RESHADE_API_VERSION);
+        return;
+    }
+    g_rs_registered = true;
+    reshade::register_event<reshade::addon_event::init_effect_runtime>(RsOnInitRuntime);
+    reshade::register_event<reshade::addon_event::destroy_effect_runtime>(RsOnDestroyRuntime);
+    reshade::register_event<reshade::addon_event::reshade_reloaded_effects>(RsOnReloaded);
+    reshade::register_event<reshade::addon_event::reshade_open_overlay>(RsOnOpenOverlay);
+    reshade::register_event<reshade::addon_event::reshade_present>(RsOnPresent);
+    reshade::register_event<reshade::addon_event::reshade_finish_effects>(RsOnFinishEffects);
+    Log("[host] registered with ReShade as an add-on (API %d): DEPTH binding and frame counters are available", RESHADE_API_VERSION);
+}
+
+static bool FrameFormatOk(DXGI_FORMAT typed)
+{
+    return typed == DXGI_FORMAT_R8G8B8A8_UNORM || typed == DXGI_FORMAT_B8G8R8A8_UNORM ||
+           typed == DXGI_FORMAT_R10G10B10A2_UNORM || typed == DXGI_FORMAT_R16G16B16A16_FLOAT;
+}
+
+static void FrameModeWaitIdle(DWORD ms)
+{
+    if (g_fm_fence != nullptr && !WaitFenceValue(g_fm_fence, g_fm_val, ms))
+        Log("[host] frame mode: the pump queue had not retired after %lu ms (the window is not being composited); going on", ms);
+}
+
+// Called on every successful build, before its feature is used. `src` is what will be copied
+// into the back buffer; `depth` the slot MGPU's tap should see.
+static void FrameModeEnter(ID3D12Resource *src, ID3D12Resource *depth, bool hdr)
+{
+    g_fm_ok  = false;
+    g_fm_src = nullptr;
+    if (!g_mgpu_mode || h.swap == nullptr || src == nullptr) return;
+
+    const D3D12_RESOURCE_DESC od = src->GetDesc();
+    const DXGI_FORMAT typed = FeedFmtTypedColor(od.Format);
+    if (!FrameFormatOk(typed))
+    {
+        Log("[host] WARNING: frame mode: the Output is %s, which a swapchain cannot be; MGPU gets no frames from this build",
+            FeedFmtName(od.Format));
+        return;
+    }
+
+    if (g_fm_list == nullptr)
+    {
+        for (auto &a : g_fm_alloc)
+            h.dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator),
+                                          reinterpret_cast<void **>(&a));
+        if (g_fm_alloc[0] != nullptr)
+            h.dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_fm_alloc[0], nullptr,
+                                     __uuidof(ID3D12GraphicsCommandList), reinterpret_cast<void **>(&g_fm_list));
+        if (g_fm_list != nullptr) g_fm_list->Close();
+        h.dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), reinterpret_cast<void **>(&g_fm_fence));
+        if (g_fm_list == nullptr || g_fm_fence == nullptr || g_fm_alloc[1] == nullptr || g_fm_alloc[2] == nullptr)
+        { Log("[host] WARNING: frame mode: command objects could not be created; MGPU gets no frames"); return; }
+    }
+
+    const UINT w = static_cast<UINT>(od.Width), ht = od.Height;
+    if (!g_frame_mode || w != g_bb_w || ht != g_bb_h || typed != g_bb_fmt)
+    {
+        // Same rule as HostResize: everything recorded against the old buffers first.
+        if (g_pump_fence  != nullptr) WaitFenceValue(g_pump_fence,  g_pump_val,  150);
+        if (g_panel_fence != nullptr) WaitFenceValue(g_panel_fence, g_panel_val, 150);
+        FrameModeWaitIdle(150);
+        if (g_swap3 != nullptr) { g_swap3->Release(); g_swap3 = nullptr; }
+        const HRESULT hr = h.swap->ResizeBuffers(3, w, ht, typed, DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT);
+        h.swap->QueryInterface(__uuidof(IDXGISwapChain3), reinterpret_cast<void **>(&g_swap3));
+        if (FAILED(hr))
+        {
+            Log("[host] WARNING: frame mode: ResizeBuffers(%ux%u %s) failed 0x%08X (%s); MGPU gets no frames from this build",
+                w, ht, FeedFmtName(typed), hr, FeedHrName(hr));
+            return;
+        }
+        if (!g_frame_mode)
+        {
+            // The banner and the panel belong to the other life of this window.
+            if (g_banner != nullptr) { g_banner->Release(); g_banner = nullptr; }
+            if (h.panel != nullptr) { h.panel->Release(); h.panel = nullptr; }
+            if (h.panel_local != nullptr) { CloseHandle(h.panel_local); h.panel_local = nullptr; }
+            h.panel_host_owned = false;
+            g_panel_ready = false;
+        }
+        g_frame_mode = true;
+        g_bb_w = w; g_bb_h = ht; g_bb_fmt = typed;
+        g_fm_latched = false;
+
+        // What MGPU (through ReShade's swapchain) is told about the transfer function.
+        const DXGI_COLOR_SPACE_TYPE cs = typed == DXGI_FORMAT_R16G16B16A16_FLOAT ? DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709
+                                       : (typed == DXGI_FORMAT_R10G10B10A2_UNORM && hdr) ? DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
+                                                                                         : DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+        const HRESULT hc = g_swap3 != nullptr ? g_swap3->SetColorSpace1(cs) : E_NOINTERFACE;
+        Log("[host] frame mode: swapchain is now %ux%u %s (the window stays %dx%d and DXGI scales into it); colour space %s%s",
+            w, ht, FeedFmtName(typed), g_win_w, g_win_h,
+            cs == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709 ? "scRGB" : cs == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 ? "HDR10 PQ" : "sRGB",
+            SUCCEEDED(hc) ? "" : " (not accepted; left as it was)");
+    }
+    if (g_swap3 == nullptr) h.swap->QueryInterface(__uuidof(IDXGISwapChain3), reinterpret_cast<void **>(&g_swap3));
+
+    // The depth copy. SIMULTANEOUS_ACCESS: written on h.queue (COPY_DEST) and read on pump_queue
+    // (the tap's SRV) with no barrier on either side, so the two queues can never disagree about
+    // its state; the worst a late pump can see is a torn depth, never an invalid one.
+    if (depth != nullptr)
+    {
+        const D3D12_RESOURCE_DESC dd = depth->GetDesc();
+        D3D12_RESOURCE_DESC have = {};
+        if (g_mgpu_depth != nullptr) have = g_mgpu_depth->GetDesc();
+        if (g_mgpu_depth == nullptr || have.Width != dd.Width || have.Height != dd.Height)
+        {
+            FrameModeWaitIdle(500);
+            RsUnbindDepth();
+            if (g_mgpu_depth != nullptr) { g_mgpu_depth->Release(); g_mgpu_depth = nullptr; }
+            D3D12_HEAP_PROPERTIES hp = {};
+            hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC rd = {};
+            rd.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            rd.Width            = dd.Width;
+            rd.Height           = dd.Height;
+            rd.DepthOrArraySize = 1;
+            rd.MipLevels        = 1;
+            rd.Format           = DXGI_FORMAT_R32_FLOAT;
+            rd.SampleDesc.Count = 1;
+            rd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
+            const HRESULT hr = h.dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                              __uuidof(ID3D12Resource), reinterpret_cast<void **>(&g_mgpu_depth));
+            if (FAILED(hr)) { g_mgpu_depth = nullptr; Log("[host] WARNING: frame mode: the depth copy texture failed 0x%08X; MGPU's tap reads nothing", hr); }
+        }
+        RsBindDepth("build");
+    }
+
+    g_fm_src = src;
+    g_fm_ok  = true;
+}
+
+// One present for one evaluate (fresh), or the same frame again while ReShade's overlay is open
+// and the game has gone quiet (so the panel stays usable). Never blocks.
+static bool PumpFrame(bool fresh)
+{
+    if (!g_frame_mode || !g_fm_ok || g_fm_src == nullptr || g_swap3 == nullptr || g_fm_list == nullptr) return false;
+    if (fresh) ++g_fm_evals;
+
+    // ReShade skips its whole present hook -- effects, reshade_finish_effects, the present event:
+    // everything MGPU runs on -- for a DO_NOT_WAIT present that follows one answered
+    // WAS_STILL_DRAWING, on the theory that the app is retrying the same frame. We never retry;
+    // the next present is a NEW frame. A PRESENT_TEST present skips the hook too but does reach
+    // the code that clears that latch, and presents nothing.
+    if (g_fm_latched && g_mgpu_latch_clear) { h.swap->Present(0, DXGI_PRESENT_TEST); g_fm_latched = false; }
+
+    const int slot = g_fm_slot;
+    if (g_fm_fence->GetCompletedValue() < g_fm_alloc_val[slot]) { ++g_fm_no_slot; return false; }
+
+    ID3D12Resource *bb = nullptr;
+    if (FAILED(g_swap3->GetBuffer(g_swap3->GetCurrentBackBufferIndex(), __uuidof(ID3D12Resource),
+                                  reinterpret_cast<void **>(&bb))) || bb == nullptr)
+        return false;
+    bool recorded = false;
+    if (SUCCEEDED(g_fm_alloc[slot]->Reset()) && SUCCEEDED(g_fm_list->Reset(g_fm_alloc[slot], nullptr)))
+    {
+        D3D12_RESOURCE_BARRIER b = {};
+        b.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource   = bb;
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+        b.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        g_fm_list->ResourceBarrier(1, &b);
+        g_fm_list->CopyResource(bb, g_fm_src);   // the source is in COMMON between submissions: promoted to COPY_SOURCE here
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        b.Transition.StateAfter  = D3D12_RESOURCE_STATE_PRESENT;
+        g_fm_list->ResourceBarrier(1, &b);
+        g_fm_list->Close();
+        if (fresh && g_last_eval_fence != 0) h.pump_queue->Wait(h.fence, g_last_eval_fence);
+        ID3D12CommandList *lists[] = { g_fm_list };
+        h.pump_queue->ExecuteCommandLists(1, lists);
+        h.pump_queue->Signal(g_fm_fence, ++g_fm_val);
+        g_fm_alloc_val[slot] = g_fm_val;
+        g_fm_slot = (slot + 1) % 3;
+        recorded = true;
+    }
+    bb->Release();
+    if (!recorded) return false;
+
+    const HRESULT hr = h.swap->Present(0, DXGI_PRESENT_DO_NOT_WAIT);
+    if (hr == DXGI_ERROR_WAS_STILL_DRAWING) { ++g_fm_still; g_fm_latched = true; return false; }
+    if (FAILED(hr))
+    {
+        if (++g_fm_failed == 1 || (g_fm_failed % 1800) == 0)
+            Log("[host] frame mode: Present failed 0x%08X (%s), %llu so far", hr, FeedHrName(hr), g_fm_failed);
+        return false;
+    }
+    ++g_fm_presents;
+    return true;
+}
+
+static void FrameModeReport(const char *when)
+{
+    if (!g_frame_mode) return;
+    const LONG rp = g_rs_presents, rf = g_rs_finishes;
+    Log("[host] frame mode (%s): %llu evaluates, %llu presented, %llu WAS_STILL_DRAWING, %llu without a free slot, %llu "
+        "failed | ReShade on this window: %ld present events, %ld finish_effects (%s)",
+        when, g_fm_evals, g_fm_presents, g_fm_still, g_fm_no_slot, g_fm_failed, rp, rf,
+        !g_rs_registered ? "not registered, so not counted" : rf == 0 ? "NONE -- no technique is loaded here, so MGPU captures no colour: put "
+                           MGPU_TAP_FX " in host64" : "MGPU's colour capture fires on each");
+}
+
+static void FrameModeShutdown()
+{
+    FrameModeWaitIdle(500);
+    RsUnbindDepth();
+    auto rel = [](IUnknown *&q) { if (q != nullptr) { q->Release(); q = nullptr; } };
+    rel(reinterpret_cast<IUnknown *&>(g_mgpu_depth)); rel(reinterpret_cast<IUnknown *&>(g_mgpu_sim_tex));
+    rel(reinterpret_cast<IUnknown *&>(g_fm_list));    rel(reinterpret_cast<IUnknown *&>(g_fm_fence));
+    for (auto &a : g_fm_alloc) rel(reinterpret_cast<IUnknown *&>(a));
 }
 
 typedef HRESULT (WINAPI *PFN_D3D12CreateDevice_)(IUnknown *, D3D_FEATURE_LEVEL, REFIID, void **);
@@ -1617,6 +2103,21 @@ static bool PumpPresent(bool force = false)
             PostMessageW(h.hwnd, WM_KEYUP, g_overlay_key, 1 | (scan << 16) | (1u << 30) | (1u << 31));
             Log("[host] opened ReShade's overlay (key %u) so the neural consumer's panel is in view", g_overlay_key);
         }
+    }
+
+    // MGPU frame mode: a present here would be a frame MGPU captures, and it must capture each
+    // evaluate once -- so the per-evaluate call site uses PumpFrame(true) instead of this, and
+    // everything else gets a present only while ReShade's overlay is open and nothing has been
+    // presented for 100 ms (so MGPU's panel stays usable while the game is paused or loading).
+    if (g_frame_mode)
+    {
+        static ULONGLONG last_fm = 0;
+        static unsigned long long last_count = 0;
+        const ULONGLONG t = GetTickCount64();
+        if (g_fm_presents != last_count) { last_count = g_fm_presents; last_fm = t; }
+        if (force || !g_rs_overlay_open || t - last_fm < 100) return false;
+        last_fm = t;
+        return PumpFrame(false);
     }
 
     // Idle throttle: with no frames arriving there is nothing to show, so 30 Hz is plenty.
@@ -1783,6 +2284,71 @@ static bool ReShadeOwnsCreateDevice(HMODULE d3d12, FARPROC p)
     return b[0] == 0xE9 || b[0] == 0xEB || (b[0] == 0xFF && b[1] == 0x25);
 }
 
+// --d3d12-debug (rig only): the debug layer, asked for before the device exists, and whatever it
+// stored read back at the end of --test. Needs the Windows "Graphics Tools" optional feature.
+static bool g_d3d12_debug = false;
+
+static void DebugLayerEnable(HMODULE d3d12)
+{
+    if (!g_d3d12_debug || d3d12 == nullptr) return;
+    typedef HRESULT (WINAPI *PFN_GetDebug)(REFIID, void **);
+    auto get_debug = reinterpret_cast<PFN_GetDebug>(GetProcAddress(d3d12, "D3D12GetDebugInterface"));
+    ID3D12Debug *dbg = nullptr;
+    if (get_debug != nullptr && SUCCEEDED(get_debug(__uuidof(ID3D12Debug), reinterpret_cast<void **>(&dbg))) && dbg != nullptr)
+    {
+        dbg->EnableDebugLayer();
+        dbg->Release();
+        Log("[host] --d3d12-debug: the D3D12 debug layer is on");
+    }
+    else
+    {
+        g_d3d12_debug = false;
+        Log("[host] --d3d12-debug: the debug layer is not available (install the Windows optional feature \"Graphics Tools\")");
+    }
+}
+
+// Something in this process (measured: 2087 messages denied, none stored) installs a storage
+// filter that refuses everything, so an untouched queue reads "0 errors" whatever happens. Put
+// an empty filter on top -- one that refuses nothing -- before the work that is to be judged.
+static void DebugLayerArm()
+{
+    if (!g_d3d12_debug || h.dev == nullptr) return;
+    ID3D12InfoQueue *q = nullptr;
+    if (FAILED(h.dev->QueryInterface(__uuidof(ID3D12InfoQueue), reinterpret_cast<void **>(&q))) || q == nullptr) return;
+    static bool pushed = false;
+    if (!pushed) { pushed = true; q->PushEmptyStorageFilter(); q->SetMessageCountLimit(4096); q->ClearStoredMessages(); }
+    else q->ClearStorageFilter();   // whoever filtered again since: empty the top of the stack, keep what is stored
+    q->Release();
+}
+
+static void DebugLayerReport()
+{
+    if (!g_d3d12_debug || h.dev == nullptr) return;
+    ID3D12InfoQueue *q = nullptr;
+    if (FAILED(h.dev->QueryInterface(__uuidof(ID3D12InfoQueue), reinterpret_cast<void **>(&q))) || q == nullptr)
+    { Log("[host] --d3d12-debug: this device exposes no info queue (ReShade's proxy, or the layer did not attach)"); return; }
+    if (GetModuleHandleW(L"d3d12sdklayers.dll") == nullptr)
+        Log("[host] --d3d12-debug: d3d12sdklayers.dll is NOT in this process, so nothing below was actually checked");
+    const UINT64 n = q->GetNumStoredMessages();
+    UINT64 errors = 0, shown = 0;
+    for (UINT64 i = 0; i < n; ++i)
+    {
+        SIZE_T len = 0;
+        if (FAILED(q->GetMessage(i, nullptr, &len)) || len == 0) continue;
+        std::vector<char> buf(len);
+        D3D12_MESSAGE *m = reinterpret_cast<D3D12_MESSAGE *>(buf.data());
+        if (FAILED(q->GetMessage(i, m, &len))) continue;
+        if (m->Severity > D3D12_MESSAGE_SEVERITY_ERROR) continue;   // corruption 0, error 1, then warning/info/message
+        ++errors;
+        if (shown < 12) { ++shown; Log("[host] --d3d12-debug: [%s #%d] %.700s", m->Severity == D3D12_MESSAGE_SEVERITY_ERROR ? "error" : "CORRUPTION", (int)m->ID, m->pDescription); }
+    }
+    Log("[host] --d3d12-debug: storage filter allowed %llu, denied %llu, discarded by the count limit %llu",
+        q->GetNumMessagesAllowedByStorageFilter(), q->GetNumMessagesDeniedByStorageFilter(), q->GetNumMessagesDiscardedByMessageCountLimit());
+    Log("[host] --d3d12-debug: %llu stored messages, %llu of them errors%s", n, errors,
+        q->GetNumMessagesDiscardedByMessageCountLimit() != 0 ? " (the store overflowed; some were discarded)" : "");
+    q->Release();
+}
+
 static bool InitDisguise()
 {
     // ReShade first: the app-directory dxgi.dll IS ReShade x64. Loading it before
@@ -1817,6 +2383,8 @@ static bool InitDisguise()
     const bool reshade_dxgi = dxgi != nullptr && dxgi_path[0] != L'\0' && sysdir[0] != L'\0' &&
                               CompareStringOrdinal(dxgi_path, static_cast<int>(wcslen(sysdir)),
                                                    sysdir, -1, TRUE) != CSTR_EQUAL;
+
+    DebugLayerEnable(d3d12);
 
     FARPROC raw_create_device = d3d12 ? GetProcAddress(d3d12, "D3D12CreateDevice") : nullptr;
     if (!reshade_dxgi)
@@ -1886,8 +2454,35 @@ static bool InitDisguise()
     if (h.hwnd == nullptr) { Log("[host] window creation failed"); return false; }
     if (g_show_window) ShowWindow(h.hwnd, SW_SHOWNOACTIVATE);   // never steal the game's focus
 
-    HRESULT hr = create_device(nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device),
+    // The game's adapter, when the add-on could name it (--adapter-luid). DXGI's default adapter is
+    // the right one on almost every machine and the wrong one on exactly the machines MGPU Bridge
+    // is for: two GPUs, and the shared textures only open on the one that created them (#100).
+    IDXGIAdapter *game_adapter = nullptr;
+    if (g_want_luid)
+    {
+        IDXGIFactory4 *f4 = nullptr;
+        if (SUCCEEDED(create_factory(__uuidof(IDXGIFactory4), reinterpret_cast<void **>(&f4))) && f4 != nullptr)
+        {
+            const HRESULT ha = f4->EnumAdapterByLuid(g_game_luid, __uuidof(IDXGIAdapter), reinterpret_cast<void **>(&game_adapter));
+            if (FAILED(ha) || game_adapter == nullptr)
+            {
+                game_adapter = nullptr;
+                Log("[host] WARNING: the game named adapter LUID %08lX:%08lX, which DXGI does not list here (0x%08X); using "
+                    "the default adapter", (unsigned long)g_game_luid.HighPart, (unsigned long)g_game_luid.LowPart, ha);
+            }
+            f4->Release();
+        }
+    }
+    g_on_game_adapter = game_adapter != nullptr;
+    HRESULT hr = create_device(game_adapter, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device),
                                reinterpret_cast<void **>(&h.dev));
+    if (FAILED(hr) && game_adapter != nullptr)
+    {
+        Log("[host] WARNING: D3D12CreateDevice on the game's adapter failed 0x%08X (%s); trying the default adapter", hr, FeedHrName(hr));
+        g_on_game_adapter = false;
+        hr = create_device(nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), reinterpret_cast<void **>(&h.dev));
+    }
+    if (game_adapter != nullptr) game_adapter->Release();
     if (FAILED(hr))
     {
         Log("[host] D3D12CreateDevice failed 0x%08X (%s)", hr, FeedHrName(hr));
@@ -1906,6 +2501,8 @@ static bool InitDisguise()
     h.dev->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue), reinterpret_cast<void **>(&h.pump_queue));
     h.dev->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue), reinterpret_cast<void **>(&h.queue));
     if (h.pump_queue == nullptr || h.queue == nullptr) { Log("[host] queue creation failed"); return false; }
+
+    RsRegister();   // MGPU mode only; before the swapchain, so its runtime's init event reaches us
 
     IDXGIFactory2 *factory = nullptr;
     hr = create_factory(__uuidof(IDXGIFactory2), reinterpret_cast<void **>(&factory));
@@ -2029,8 +2626,10 @@ static void LogHostAdapter()
         }
         f->Release();
     }
-    Log("[host] device adapter: %ls  LUID %08lX:%08lX  PCI %04X:%04X  driver %s (DXGI's default adapter)",
-        desc, (unsigned long)luid.HighPart, (unsigned long)luid.LowPart, vendor, device, driver);
+    Log("[host] device adapter: %ls  LUID %08lX:%08lX  PCI %04X:%04X  driver %s (%s)",
+        desc, (unsigned long)luid.HighPart, (unsigned long)luid.LowPart, vendor, device, driver,
+        g_on_game_adapter ? "the game's adapter, as named by the add-on"
+                          : g_want_luid ? "DXGI's default adapter -- NOT the one the add-on named" : "DXGI's default adapter");
     g_driver_x100 = driver[0] != '?' ? static_cast<unsigned>(atof(driver) * 100.0 + 0.5) : 0;
 
     // 616.64 and the v4.6+ RenoDX engine: reproduced here, on this machine, in --test.
@@ -2361,6 +2960,7 @@ static bool Evaluate(ID3D12Resource *color, ID3D12Resource *output, ID3D12Resour
                      UINT w, UINT h_, int reset, float mvsx, float mvsy, float jitter_x = 0.0f, float jitter_y = 0.0f)
 {
     if (NgxRefuse("evaluate")) return false;
+    DebugLayerArm();   // rig only; a no-op otherwise
     if (!BeginCommands()) return false;
 
     NVSDK_NGX_D3D12_DLSS_Eval_Params ep = {};
@@ -2387,9 +2987,44 @@ static bool Evaluate(ID3D12Resource *color, ID3D12Resource *output, ID3D12Resour
     ID3D12Resource *const opti_in[3] = { color, depth, mv };
     if (g_opti.routed) OptiBarriers(opti_in, 3, output, true);
 
+    // MGPU mode. Its calibrator records, on THIS list and before the real evaluate, a barrier on the
+    // vector texture from PIXEL|NON_PIXEL shader resource to COPY_SOURCE and back -- the state a
+    // game's velocity buffer is in. Ours sits in COMMON, so give it that state for the call. And
+    // the depth the tap will read is copied now, on this queue, where the game cannot be writing it
+    // (it holds its next input copies behind fence_out).
+    const bool mgpu_states = g_mgpu_mode && !g_opti.routed && mv != nullptr;
+    D3D12_RESOURCE_BARRIER mvb = {};
+    if (mgpu_states)
+    {
+        if (g_mgpu_depth != nullptr && depth != nullptr) h.list->CopyResource(g_mgpu_depth, depth);
+        mvb.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        mvb.Transition.pResource   = mv;
+        mvb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        mvb.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+        mvb.Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        h.list->ResourceBarrier(1, &mvb);
+        if (g_mgpu_sim && g_mgpu_sim_tex != nullptr)
+        {
+            // Byte for byte what MGPU's hook_evaluate records (calibrator.cpp, R106), so the debug
+            // layer can judge it on a machine where MGPU itself refuses to arm.
+            D3D12_RESOURCE_BARRIER sb = mvb;
+            sb.Transition.StateBefore = mvb.Transition.StateAfter;
+            sb.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            h.list->ResourceBarrier(1, &sb);
+            h.list->CopyResource(g_mgpu_sim_tex, mv);
+            std::swap(sb.Transition.StateBefore, sb.Transition.StateAfter);
+            h.list->ResourceBarrier(1, &sb);
+        }
+    }
+
     DWORD ecode = 0;
     NVSDK_NGX_Result re = SafeEvaluateDLSS(&ep, &ecode);
     if (ecode != 0) { AbortCommands(); LogNgxFault("evaluate"); return false; }
+    if (mgpu_states)
+    {
+        std::swap(mvb.Transition.StateBefore, mvb.Transition.StateAfter);
+        h.list->ResourceBarrier(1, &mvb);
+    }
     if (g_opti.routed)
     {
         OptiBarriers(opti_in, 3, nullptr, false);
@@ -2422,7 +3057,7 @@ static bool Evaluate(ID3D12Resource *color, ID3D12Resource *output, ID3D12Resour
         h.list->ResourceBarrier(1, &bar);
         h.list->CopyResource(h.tex[FEED_OUTPUT], h.out_scratch);
     }
-    EndCommands();
+    g_last_eval_fence = EndCommands();
     if (NVSDK_NGX_FAILED(re)) { Log("[host] evaluate failed 0x%08X (%s)", re, NgxResultName(re)); return false; }
     return true;
 }
@@ -2537,6 +3172,9 @@ static int RunTest()
     ID3D12Resource *mv     = MakeTex(W, H, DXGI_FORMAT_R16G16_FLOAT, false);
     if (!color || !output || !depth || !mv) { Log("[host] test texture creation failed"); return 1; }
 
+    if (g_mgpu_sim) g_mgpu_sim_tex = MakeTex(W, H, DXGI_FORMAT_R16G16_FLOAT, false);
+    DebugLayerArm();
+
     // Give the DLSS 5 add-on its hook-arming time, with the swapchain pumping.
     for (int i = 0; i < 120; ++i) { PumpPresent(true); Sleep(8); }
 
@@ -2544,15 +3182,17 @@ static int RunTest()
                 NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
     NVSDK_NGX_Result rf = NVSDK_NGX_Result_Fail;
     if (!CreateFeature(W, H, flags, &rf)) return 1;
+    FrameModeEnter(output, depth, false);   // MGPU mode only: from here the swapchain is the 640x360 "game"
 
     int good = 0;
     for (int i = 0; i < 300; ++i)
     {
-        PumpPresent(true);
+        if (!g_frame_mode) PumpPresent(true);
         if (Evaluate(color, output, depth, mv, W, H, i == 0 ? 1 : 0, 1.0f, 1.0f)) ++good;
         else break;
+        if (g_frame_mode) { PumpMessagesGuarded(); PumpFrame(true); Sleep(4); }   // a game's pace, roughly: DWM needs time to hand buffers back
         if (i == 1 && g_opti.routed) OptiBackendCheck(&Log, "host", g_opti.upscaler, &g_opti_backend);
-        if (i == 180 && !g_opti.routed)   // the warm-up re-create, same medicine as in-game; OptiScaler is the callee and needs none
+        if (i == 180 && !g_opti.routed && !g_mgpu_mode)   // the warm-up re-create, same medicine as in-game; OptiScaler is the callee and needs none, MGPU would lose a handle slot to it
         {
             Log("[host] warm-up: re-creating the feature once");
             NVSDK_NGX_Handle *old = h.feature;
@@ -2562,6 +3202,16 @@ static int RunTest()
         }
     }
     Log("[host] --test finished: %d/300 evaluates succeeded", good);
+    if (g_frame_mode)
+    {
+        WaitFenceValue(h.fence, h.fence_value, 2000);
+        FrameModeWaitIdle(2000);
+        FrameModeReport("--test");
+        Log("[host] --test: MGPU Bridge %s", !g_mgpu.present ? "is not in this folder (--mgpu-frames)"
+            : MgpuLoadedModule(g_mgpu) != nullptr ? "was loaded by ReShade; its own lines are [MGPU] in ReShade.log"
+                                                  : "is in this folder but ReShade did NOT load it");
+    }
+    DebugLayerReport();
     if (g_opti.present)
         Log("[host] --test: neural consumer %s (%s): NGX %s, neural model %s, upscaler asked for: %s",
             g_opti.nr_fork ? OPTI_LABEL : "OptiScaler (upstream, no neural pass)", g_opti.module,
@@ -2709,7 +3359,8 @@ static int Serve(DWORD game_pid)
     // Nothing else may be read -- FeedBuild and FeedBuildAck changed size between
     // versions, so a mismatched pair would desync the pipe on the very next message.
     FeedHelloAck ack = { FEED_IPC_MAGIC, FEED_IPC_VERSION };
-    if (g_panel_ready) { ack.panel_width = static_cast<uint32_t>(g_win_w); ack.panel_height = static_cast<uint32_t>(g_win_h); }
+    // MGPU mode has no panel to offer: this window is about to become the game's own frame.
+    if (g_panel_ready && !g_mgpu_mode) { ack.panel_width = static_cast<uint32_t>(g_win_w); ack.panel_height = static_cast<uint32_t>(g_win_h); }
     WriteFull(pipe, &ack, sizeof(ack));
     if (hello.version != FEED_IPC_VERSION)
     {
@@ -2781,7 +3432,7 @@ static int Serve(DWORD game_pid)
     UINT64 evaluated  = 0;
     UINT64 outcome_frames = 0;
     bool   outcome_logged = false;
-    bool   warm_done  = g_renodx_lazy || g_opti.routed;   // v45+ adopts missed creates on its own; OptiScaler IS the callee; Chicken: see the build below
+    bool   warm_done  = g_renodx_lazy || g_opti.routed || g_mgpu_mode;   // v45+ adopts missed creates on its own; OptiScaler IS the callee; MGPU has four handle slots; Chicken: see the build below
     UINT64 opti_frames = 0;
     int    build_fails = 0;
 
@@ -2848,6 +3499,8 @@ static int Serve(DWORD game_pid)
             // wait for.
             if (!WaitFenceValue(h.fence, h.fence_value, 2000))
                 Log("[host] rebuild: the previous frame's GPU work did not retire within 2 s");
+            // Frame mode copies OUT of the Output on the pump queue, which the wait above does not cover.
+            if (g_frame_mode) { FrameModeWaitIdle(500); g_fm_ok = false; g_fm_src = nullptr; }
             SafeReleaseFeature(h.feature);
             h.feature = nullptr;
             for (int i = 0; i < FEED_SLOTS; ++i)
@@ -2926,7 +3579,7 @@ static int Serve(DWORD game_pid)
                 }
                 // v7: the panel texture for a client that cannot export one -- created once
                 // per session, a fresh duplicate of its handle on every build. Never fatal.
-                if (ok && g_panel_ready)
+                if (ok && g_panel_ready && !g_mgpu_mode)
                 {
                     if (h.panel == nullptr)
                     {
@@ -3016,7 +3669,7 @@ static int Serve(DWORD game_pid)
             if (h.panel != nullptr && !h.panel_host_owned && g_panel_fence != nullptr)
                 WaitFenceValue(g_panel_fence, g_panel_val, 500);
             if (h.panel != nullptr && !h.panel_host_owned) { h.panel->Release(); h.panel = nullptr; }
-            if (b.panel_tex != 0 && g_panel_ready && !h.panel_host_owned)
+            if (b.panel_tex != 0 && g_panel_ready && !g_mgpu_mode && !h.panel_host_owned)
             {
                 HANDLE local = nullptr;
                 if (!DuplicateHandle(hgame, reinterpret_cast<HANDLE>(static_cast<uintptr_t>(b.panel_tex)),
@@ -3084,11 +3737,15 @@ static int Serve(DWORD game_pid)
             outcome_logged = false;
             // No warm-up without NGX, with v45+, or when Chicken already had its detours ARMED
             // at this create (then it saw it). Otherwise the block below waits for ARMED.
-            warm_done = transport_only || g_renodx_lazy || g_opti.routed || (g_chicken_present && !g_chicken_created_unarmed);
+            warm_done = transport_only || g_renodx_lazy || g_opti.routed || g_mgpu_mode || (g_chicken_present && !g_chicken_created_unarmed);
+
+            // MGPU mode: the swapchain takes this build's size and format, and DEPTH is (re)bound.
+            if (ok && !transport_only) FrameModeEnter(h.tex[FEED_OUTPUT], h.tex[FEED_DEPTH], b.hdr != 0);
 
             FeedBuildAck back = {};
             back.ok         = ok ? 1 : 0;
             back.ngx_result = static_cast<uint32_t>(rf);
+            if (g_frame_mode && g_fm_ok) back.flags |= FEED_ACK_MGPU_FRAMES;
             if (sr_unavailable)   back.flags |= FEED_ACK_SR_UNAVAILABLE;
             else if (ok && want_sr) { back.flags |= FEED_ACK_SR_ACTIVE; back.sr_quality = static_cast<uint32_t>(h.sr_quality); }
             back.fence_in   = reinterpret_cast<uint64_t>(game_in);
@@ -3307,6 +3964,15 @@ static int Serve(DWORD game_pid)
             // repayment plus this evaluate's own present is two, the debt still exists, still
             // caps at 4, and the idle path below still repays it without limit -- so #33's
             // reasoning is untouched, and so is one-Present-per-evaluate.
+            if (g_frame_mode)
+            {
+                // Exactly one present per evaluate, and only for an evaluate that produced a frame:
+                // no debt, no repayment, no banner. See PumpFrame.
+                PumpMessagesGuarded();
+                if (done && !transport_only) { PumpFrame(true); ++g_pace_presents; }
+                if ((fm.n % 1800) == 0) FrameModeReport("running");
+                continue;
+            }
             const unsigned long long owed_before = g_present_owed;
             PumpRetireOwedPresents(1);
             g_pace_presents += 1 + (owed_before - g_present_owed);
@@ -3346,6 +4012,7 @@ static void ShutdownDisguise()
         if (g_pump_fence  != nullptr) WaitFenceValue(g_pump_fence,  g_pump_val,  500);
         if (g_panel_fence != nullptr) WaitFenceValue(g_panel_fence, g_panel_val, 500);
     }
+    FrameModeShutdown();
     auto rel = [](IUnknown *&p) { if (p != nullptr) { p->Release(); p = nullptr; } };
     rel(reinterpret_cast<IUnknown *&>(g_panel_list));  rel(reinterpret_cast<IUnknown *&>(g_panel_alloc));
     rel(reinterpret_cast<IUnknown *&>(g_panel_fence)); rel(reinterpret_cast<IUnknown *&>(g_pump_list));
@@ -3525,6 +4192,16 @@ int main(int argc, char **argv)
         else if (strcmp(argv[i], "--hide") == 0) hide = true;
         else if (strcmp(argv[i], "--behind") == 0) behind = true;
         else if (strcmp(argv[i], "--gpu-priority") == 0) gpu_priority = true;
+        else if (strcmp(argv[i], "--d3d12-debug") == 0) g_d3d12_debug = true;   // rig: the D3D12 debug layer, reported at the end of --test
+        else if (strcmp(argv[i], "--mgpu-frames") == 0) g_mgpu_force = true;    // rig: MGPU frame mode without MGPU in the folder
+        else if (strcmp(argv[i], "--mgpu-sim") == 0) g_mgpu_sim = true;         // rig: record MGPU's vector barrier + copy ourselves
+        else if (strncmp(argv[i], "--adapter-luid=", 15) == 0)
+        {
+            unsigned long hi = 0, lo = 0;
+            if (sscanf_s(argv[i] + 15, "%lx:%lx", &hi, &lo) == 2)
+            { g_game_luid.HighPart = static_cast<LONG>(hi); g_game_luid.LowPart = lo; g_want_luid = true; }
+            else Log("[host] ignoring a malformed %s", argv[i]);
+        }
         // First numeric token wins. This used to be a bare assignment, so ANY later token
         // the parser did not recognise ran through strtoul, came back 0, and silently
         // overwrote an already-parsed pid -- turning a good command line into the usage
@@ -3535,7 +4212,7 @@ int main(int argc, char **argv)
     if (!test && pid == 0)
     {
         Log("usage: dlss5-feed-host64 --test | dlss5-feed-host64 <game pid> [--hide | --behind] "
-            "[--gpu-priority]");
+            "[--gpu-priority] [--adapter-luid=HHHHHHHH:LLLLLLLL]   (rig: --d3d12-debug --mgpu-frames --mgpu-sim)");
         return 1;
     }
     g_show_window = !test && !hide;   // the visible window carries the DLSS 5 add-on's tuning panel
@@ -3546,6 +4223,7 @@ int main(int argc, char **argv)
     DetectToolkitAddon();
     DetectChickenAddon();   // after DetectRenodxAddon: it needs g_renodx_present
     DetectOptiScaler();     // after both: it warns when either is beside it
+    DetectMgpuBridge();     // after all of them, and BEFORE ReShade loads: it may add an effect path to ReShade.ini
     DetectStaleD3DCompiler();
     PrepareHostOverlay();   // edits ReShade.ini, so also BEFORE ReShade loads (InitDisguise)
 

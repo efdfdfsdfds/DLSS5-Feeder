@@ -547,6 +547,77 @@ Things learned that are not obvious:
   request was logged but nothing was written, twice. The host's own warm-up re-create at frame 180 also
   restarts the fork's auto-capture, which is one reason the routed path skips it.
 
+## 9c. MGPU Bridge instead (second GPU, ALPHA)
+
+[MGPU Bridge](https://github.com/maohgad-web/Neural-coprocessor) runs the neural model on a second
+RTX GPU in its own window. `src/feed_mgpu.h` is the whole producer side; the design and what was
+checked against MGPU's source (0.2.3) is in `docs/PLAN-MGPU-BRIDGE.md`. **No machine this project
+has can run it end to end** — it refuses without a second neural-capable adapter — so everything
+below is what a single-GPU machine can prove, and the rest is for a tester with two cards.
+
+Layout (the differences from every other consumer are the point):
+
+```
+<consumer folder>\                      game folder (64-bit D3D12 game) or host64\ (32-bit game)
+  nvngx.dll_mgpu_bridge.addon64         the file name is load-bearing on MGPU's side: do not rename
+  mgpu.ini                              BESIDE the add-on (not in mgpu\). Calib=2 MVec=3 MvecFromEval=2 as shipped
+  mgpu\nvngx_dlssnr.dll                 and NOT beside the exe (its "INSTALL PROBLEM")
+  nvngx_dlss.dll                        beside the exe, as always
+  ReShade2.ini, gpu1.ini                the runtime ReShade builds for MGPU's own window
+  reshade-shaders\Shaders\mgpu_depth_tap.fx   (host64: the helper adds this path to its ReShade.ini; host64\ itself also works)
+```
+
+No other consumer in that folder. The feeder never writes to any MGPU file.
+
+### The no-game rig
+
+Same shape as §9's rig, from in-repo files plus MGPU's release zip:
+
+```
+rig\dlss5-feed-host64.exe   dxgi.dll (deploy\reshade-dxgi\dxgi_x64.dll)   nvngx_dlss.dll
+rig\ReShade.ini             [GENERAL] EffectSearchPaths=.\
+rig\ + the MGPU layout above
+dlss5-feed-host64.exe --test --hide --d3d12-debug --mgpu-sim
+```
+
+Expected in `dlss5-feed-host.log` (measured 2026-09-17, RTX 5090 + AMD iGPU, driver 616.92):
+
+- `MGPU Bridge is the neural consumer (ALPHA …)`, `registered with ReShade as an add-on (API 20)`
+- `frame mode: swapchain is now 640x360 R8G8B8A8_UNORM`, `DEPTH semantic bound …`
+- `--test finished: 300/300`, then
+  `frame mode (--test): 300 evaluates, 300 presented, 0 WAS_STILL_DRAWING … 4xx finish_effects`
+- `--d3d12-debug: N stored messages, 0 of them errors`
+
+and in the rig's `ReShade.log`: `[MGPU][T2] REFUSING … single-adapter topology` (this machine),
+`[MGPU][R101] CALIBRATOR INSTALLED … site=iat`, `[MGPU][R134] GAME CreateFeature: id=1 … scene
+feature, the latch fires on this one`, and a periodic `[R101]` line with `resolved=1 creates=1
+sr-handle=known evaluates=N captured=N` and the helper's own table (`MVEC=0x…`, `MVecScale`,
+`CreateFlags=0x4a`). `eval-copies` stays 0 here: `MvecFromEval=2` only arms once MGPU's stream is
+armed, which needs the second GPU.
+
+Rig switches (the helper ignores them outside the rig's purpose):
+
+- `--mgpu-frames` forces frame mode with no MGPU in the folder (regression check of the path itself;
+  `finish_effects` then reads 0 and the log says why).
+- `--mgpu-sim` records MGPU's own vector barrier and copy (calibrator.cpp R106, byte for byte) before
+  each evaluate, so the debug layer judges it on a machine where MGPU will not arm.
+- `--d3d12-debug` needs the Windows "Graphics Tools" feature. Something in the process installs a
+  deny-all storage filter on the info queue (measured: 2087 denied, 0 stored), so the helper pushes
+  an empty one before the work being judged — without that, "0 errors" means nothing. Control,
+  done once by hand: a barrier with a genuinely illegal before-state removes the device
+  (`DXGI_ERROR_INVALID_CALL`), so the layer is live. A before-state of shader-resource on a texture
+  that is really in COMMON is **accepted** (COMMON promotes to read states), which is why MGPU's
+  barrier would probably pass even without the explicit transition the helper now makes.
+
+### What only a two-GPU tester can confirm
+
+MGPU arms (in-process D3D12, and through host64); `eval-copies` climbs at one per frame; the neural
+picture on GPU 1 tracks motion (vectors, depth direction, depth alignment); latency with MGPU's
+real cross-adapter fence, and whether a helper window parked behind the game stalls its pump queue
+(`frame mode … WAS_STILL_DRAWING` and `without a free slot` are the counters to read);
+`[DLSS5Host] MgpuLatchClear=0|1` A/B; more than four feature creates across resizes; `SRUpscale=1`;
+focus behaviour with `NoActivate`.
+
 ## 10. Cutting a release
 
 Tag on the release branch (`v0.12.1-beta.1` and `-beta.2` are both tagged on `v0.12.1`, not

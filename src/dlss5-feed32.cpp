@@ -61,6 +61,7 @@ static void FeedOnVkDeviceGeneration();
 #include "feed_d3d10.h"     // D3D10.1 <-> D3D11 keyed-mutex bridge + the private relay device
 #include "feed_dfc.h"       // Deep Fried Chicken: only the file scan is used here (it lives in host64\)
 #include "feed_opti.h"      // OptiScaler DLSS-NR: only the file scan and the ini reader are used here (it lives in host64 too)
+#include "feed_mgpu.h"      // MGPU Bridge: the file scan of host64\ and its ini reader
 
 #define FEED_VERSION "1.16.0-beta.4"
 #ifndef FEED_BUILD_ID
@@ -752,6 +753,7 @@ struct Feed32
     // work_upscale=2: DLSS Super Resolution on synthetic jitter (D3D11 client, IPC v6)
     bool        sr_requested;      // what the current build asked the host for
     bool        sr_active;         // the host created an SR feature (FEED_ACK_SR_ACTIVE)
+    bool        mgpu_frames;       // the host's window carries the game's frames for MGPU Bridge (FEED_ACK_MGPU_FRAMES)
     bool        sr_unavailable;    // the host said no preset covers this ratio; cleared on a size change
     uint32_t    sr_quality;        // the host's NVSDK_NGX_PerfQuality_Value
     UINT        jitter_index;      // position in the Halton sequence, restarts with the DLSS history
@@ -1536,6 +1538,12 @@ static bool CastLayout()
 {
     HWND game = g.runtime != nullptr ? static_cast<HWND>(g.runtime->get_hwnd()) : nullptr;
     if (game == nullptr || !IsWindow(game)) { strcpy_s(g_cast_status, "no game window"); return false; }
+    if (g.mgpu_frames)
+    {
+        strcpy_s(g_cast_status, "MGPU Bridge is the consumer: the host window carries this game's frames for it, so there is "
+                                "no panel to cast. MGPU's controls are in the host window's ReShade (host_window=1, Home)");
+        return false;
+    }
     if (g_host_hidden)
     {
         strcpy_s(g_cast_status, g_cfg.host_window == 2
@@ -2195,6 +2203,78 @@ static void OptiHostCfgRefresh()
     GetPrivateProfileStringA("Upscalers", "Dx12Upscaler", "?", g_opti_upscaler,  sizeof(g_opti_upscaler),  g_opti_ini_path);
 }
 
+// MGPU Bridge in host64\ -- the fourth neural consumer on the split path (see feed_mgpu.h). It is a
+// D3D12-only 64-bit ReShade add-on, so for a 32-bit game the only place it can live is the helper,
+// which IS a D3D12 process: there the helper's window becomes the game's frame (FEED_ACK_MGPU_FRAMES)
+// and MGPU captures it, second GPU and all. The helper does the detecting and says the rest in
+// dlss5-feed-host.log; this side names it, catches the wrong folder, and checks the one setting
+// only it knows -- which way depth runs. ALPHA: never run end to end (it needs two RTX GPUs).
+static MgpuInfo g_mgpu_host;
+static bool     g_mgpu_host_sole = false;   // and nothing else is in host64\ to fight it
+// The adapter the game renders on, for the helper's command line (--adapter-luid). Filled on the
+// render thread before the connect job starts; the worker only reads it.
+static char     g_host_adapter_arg[48] = "";
+
+static void DetectMgpuHost()
+{
+    char dir[MAX_PATH];
+    GetModuleFileNameA(g_self, dir, MAX_PATH);
+    if (char *s = strrchr(dir, '\\')) *(s + 1) = '\0';
+    char h64[MAX_PATH];
+    sprintf_s(h64, "%shost64\\", dir);
+
+    // Beside the 32-bit game exe: a 32-bit ReShade never loads an .addon64, so it does nothing there.
+    MgpuInfo stray;
+    if (MgpuScan(dir, dir, &stray))
+        Warn("%s is next to the 32-bit game exe, where nothing can load it (it is 64-bit and D3D12-only). For a 32-bit "
+             "game the whole MGPU Bridge set -- the add-on, mgpu.ini, mgpu\\nvngx_dlssnr.dll, ReShade2.ini, gpu1.ini and "
+             "mgpu_depth_tap.fx -- belongs in host64\\, beside dlss5-feed-host64.exe.", stray.addon);
+
+    if (!MgpuScan(h64, h64, &g_mgpu_host)) { Log("[feed32] MGPU Bridge: not present in host64\\"); return; }
+
+    char reno[MAX_PATH];
+    sprintf_s(reno, "%srenodx-dlss5*.addon64", h64);
+    WIN32_FIND_DATAA fd;
+    HANDLE f = FindFirstFileA(reno, &fd);
+    const bool renodx = f != INVALID_HANDLE_VALUE;
+    if (renodx) FindClose(f);
+    g_mgpu_host_sole = !g_chicken_host && !g_opti_host && !renodx;
+    if (g_mgpu_host_sole)
+        Log("[feed32] %s (%s): present in host64\\ -- it is the neural consumer (ALPHA: this pairing has never been run end "
+            "to end; it needs two RTX GPUs). Nothing neural comes back into this game's frame: the helper runs plain DLAA "
+            "for the game as usual, shows that result in ITS window at the game's resolution, and MGPU captures it there "
+            "for the second GPU. The in-game panel cast is off while it runs. Details are in host64\\dlss5-feed-host.log "
+            "and host64\\ReShade.log ([MGPU] lines).", MGPU_LABEL, g_mgpu_host.addon);
+    else
+        Warn("host64\\ holds MGPU Bridge AND another neural consumer (%s). The helper stays in its ordinary mode for that "
+             "one, so MGPU gets no frame and no depth and shows nothing useful. Keep exactly one and restart the game.",
+             g_chicken_host ? "Deep Fried Chicken" : g_opti_host ? "OptiScaler" : "renodx-dlss5.addon64");
+}
+
+// Called with every build the helper acknowledged: is its window carrying our frames for MGPU,
+// and does MGPU agree with us about depth?
+static void MgpuNoteAck(const FeedBuildAck &ack, bool inverted)
+{
+    const bool frames = ack.ok != 0 && (ack.flags & FEED_ACK_MGPU_FRAMES) != 0;
+    if (frames != g.mgpu_frames)
+    {
+        g.mgpu_frames = frames;
+        if (frames)
+            Log("[feed32] the helper's window now carries this game's frames for MGPU Bridge (one present per evaluate); "
+                "the in-game panel cast is off");
+    }
+    if (!frames || !g_mgpu_host.ini.found) return;
+    static int said = -1;
+    if ((g_mgpu_host.ini.depth_inverted != 0) != inverted && said != (inverted ? 1 : 0))
+    {
+        said = inverted ? 1 : 0;
+        Warn("depth direction disagrees: this add-on tells DLSS depth is %s, host64\\mgpu.ini has DepthInverted=%d. MGPU "
+             "reads the same depth (the helper binds this add-on's Depth texture as its DEPTH), so one of the two is "
+             "wrong. If DLSS5_Feed's depth debug view looks right, set DepthInverted=%d in host64\\mgpu.ini.",
+             inverted ? "reversed" : "not reversed", g_mgpu_host.ini.depth_inverted, inverted ? 1 : 0);
+    }
+}
+
 // dlss5-feed.addon64 in host64\ -- the one wrong file that looks right.
 //
 // host64\ is a 64-bit ReShade install, so a 64-bit add-on dropped in it does load, and
@@ -2258,7 +2338,7 @@ static bool HostWorkerConnect(HANDLE ev)
     GetModuleFileNameA(g_self, dir, MAX_PATH);
     if (char *s = strrchr(dir, '\\')) *(s + 1) = '\0';
 
-    char exe[MAX_PATH], cmd[MAX_PATH + 32], wd[MAX_PATH];
+    char exe[MAX_PATH], cmd[MAX_PATH + 128], wd[MAX_PATH];
     sprintf_s(exe, "%shost64\\dlss5-feed-host64.exe", dir);
     sprintf_s(wd, "%shost64", dir);
     if (GetFileAttributesA(exe) == INVALID_FILE_ATTRIBUTES)
@@ -2281,9 +2361,11 @@ static bool HostWorkerConnect(HANDLE ev)
         Log("[feed32] starting the host without a window (%s): the in-game panel is unavailable this session%s",
             g_cfg.host_window == 2 ? "host_window=2" : "the game's swapchain is exclusive fullscreen",
             g_cfg.host_window == 2 ? "" : " -- switch the game to borderless/windowed to get it back (#109)");
-    sprintf_s(cmd, "\"%s\" %lu%s%s", exe, GetCurrentProcessId(),
+    // --adapter-luid: a helper older than this build logs it as an argument it does not understand
+    // and carries on, so no protocol version is involved.
+    sprintf_s(cmd, "\"%s\" %lu%s%s%s", exe, GetCurrentProcessId(),
               hide ? " --hide" : g_cfg.host_window ? "" : " --behind",
-              g_cfg.host_gpu_priority ? " --gpu-priority" : "");
+              g_cfg.host_gpu_priority ? " --gpu-priority" : "", g_host_adapter_arg);
 
     STARTUPINFOA si = { sizeof(si) };
     PROCESS_INFORMATION pi = {};
@@ -3127,6 +3209,22 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
     if (st != XFER_DONE)
     {
     Breadcrumb("building the shared textures");
+    // Which adapter the game is on, for the helper to open its device on the same one. DXGI's
+    // default is right on one-GPU machines and a coin toss on the two-GPU machines MGPU Bridge is
+    // for -- and a shared texture only opens on the adapter that made it (#100). D3D11 only (the
+    // D3D10 relay and dgVoodoo land here too); a GL or Vulkan game leaves the helper on the default.
+    if (g_host_adapter_arg[0] == '\0' && g.dev != nullptr)
+    {
+        IDXGIDevice *xd = nullptr;
+        IDXGIAdapter *xa = nullptr;
+        DXGI_ADAPTER_DESC ad = {};
+        if (SUCCEEDED(g.dev->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void **>(&xd))) && xd != nullptr &&
+            SUCCEEDED(xd->GetAdapter(&xa)) && xa != nullptr && SUCCEEDED(xa->GetDesc(&ad)))
+            sprintf_s(g_host_adapter_arg, " --adapter-luid=%08lX:%08lX",
+                      static_cast<unsigned long>(ad.AdapterLuid.HighPart), static_cast<unsigned long>(ad.AdapterLuid.LowPart));
+        SafeRelease(xa);
+        SafeRelease(xd);
+    }
     // Connect first, and off this thread: nothing below is worth doing without a host, and
     // re-creating the shared textures on every frame of a 15 s spawn would be worse still.
     if (!HostConnectReady()) { g_build_pending = true; return false; }
@@ -3269,6 +3367,7 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
         if (ack.panel_tex != 0) CloseHandle(reinterpret_cast<HANDLE>(static_cast<uintptr_t>(ack.panel_tex)));
         return false;
     }
+    MgpuNoteAck(ack, g_cfg.depth_inverted >= 0 ? g_cfg.depth_inverted != 0 : g.depth_reversed);
 
     if (g.host_creates)
     {
@@ -3507,6 +3606,7 @@ static bool BuildSharedGl(UINT w, UINT h, DXGI_FORMAT bb_fmt, uint64_t rtv_handl
         Log("[feed32] host build failed (ngx 0x%08X)", ack.ngx_result);
         return false;
     }
+    MgpuNoteAck(ack, g_cfg.depth_inverted >= 0 ? g_cfg.depth_inverted != 0 : g.depth_reversed);
 
     // The host owns the Output format on every path where it owns the texture. Today
     // this always agrees with what we asked for -- GlSafeColorFormat has already ruled
@@ -3707,6 +3807,7 @@ static bool BuildSharedVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
         Log("[feed32] host build failed (ngx 0x%08X)", ack.ngx_result);
         return false;
     }
+    MgpuNoteAck(ack, g_cfg.depth_inverted >= 0 ? g_cfg.depth_inverted != 0 : g.depth_reversed);
 
     // The host owns the Output format: only its device can be asked whether a typed UAV
     // store to BGRA8 exists on this GPU, and it falls back to RGBA8 where it does not.
@@ -5494,6 +5595,18 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
                                g_opti_host_module,
                                g_chicken_host ? " -- Deep Fried Chicken is ALSO in host64\\; keep exactly one" : "");
     }
+    if (g_mgpu_host.present)
+    {
+        if (g_mgpu_host_sole)
+            ImGui::Text("Neural consumer: %s (host64\\%s) -- ALPHA, second GPU; %s", MGPU_LABEL, g_mgpu_host.addon,
+                        g.mgpu_frames ? "the host window carries this game's frames for it"
+                                      : g.built ? "the host did NOT enter frame mode (see host64\\dlss5-feed-host.log)" : "waiting for the first build");
+        else
+            ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.3f, 1.0f), "Neural consumer: %s (host64\\%s) -- ANOTHER consumer is also in "
+                               "host64\\; keep exactly one", MGPU_LABEL, g_mgpu_host.addon);
+        if (g_mgpu_host_sole)
+            ImGui::TextDisabled("Its picture is in ITS window on the second GPU's display, not in this game. This game shows plain DLAA.");
+    }
     if (g.frames_done > 0) ImGui::Text("Frames delivered: %llu", static_cast<unsigned long long>(g.frames_done));
     ImGui::TextWrapped("Motion vectors: %s", g_mv_status);
     if (g_mv_problem[0])
@@ -5993,6 +6106,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
                 "Enabled checkbox can undo this; nothing else runs.");
         DetectChickenHost();
         DetectOptiHost();       // after DetectChickenHost: it warns when both are in host64
+        DetectMgpuHost();       // after both, for the same reason
         DetectStrayHostAddon();
 
         RegisterReShadeCallbacks();

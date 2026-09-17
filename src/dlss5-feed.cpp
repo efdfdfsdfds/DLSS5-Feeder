@@ -61,6 +61,7 @@
 #include "feed_gl.h"   // raw-OpenGL interop for the OpenGL transport (see PLAN-OPENGL)
 #include "feed_dfc.h"  // Deep Fried Chicken interop ABI 1 (producer side)
 #include "feed_opti.h" // OptiScaler DLSS-NR as the consumer: detection and the two fingerprints
+#include "feed_mgpu.h" // MGPU Bridge (second-GPU neural rendering) as the consumer: layout and ini checks
 #include "feed_fsr1.h" // AMD FSR 1 EASU + RCAS: the optional expand-back for work_resolution < 100%
 #include "feed_pq12.h" // the D3D12 PQ<->linear pass, for the transports with no shaders of their own
 
@@ -823,8 +824,25 @@ static bool DetectSmoothMotion()
 //
 // ReShade already knows the answer -- the swapchain carries the colour space the app set --
 // so ask it instead of guessing. IDXGISwapChain3 has no GetColorSpace1 to ask directly.
+//
+// WHICH swapchain, though. This used to keep the last one to initialise, and a process can have
+// several: NVIDIA Smooth Motion adds an invisible proxy, and MGPU Bridge presents the second
+// GPU's output through a swapchain of its own -- created after the game's, so it was the one
+// asked, and its colour space (not the game's) decided whether the PQ bridge ran. Every live
+// swapchain is tracked now and the one on the BOUND effect runtime's window answers.
 // ---------------------------------------------------------------------------
-static reshade::api::swapchain *g_swapchain = nullptr;
+struct PresentChain
+{
+    reshade::api::swapchain *sc;
+    HWND                     hwnd;
+    char                     wclass[48];
+    bool                     foreign;   // Smooth Motion's proxy or MGPU Bridge's window: never the game's
+};
+static PresentChain g_chains[8];
+static int          g_chain_count;
+static SRWLOCK      g_chain_lock = SRWLOCK_INIT;   // MGPU creates its swapchain on a thread of its own
+
+static HWND BoundRuntimeHwnd();   // defined with the runtime tracking, far below
 
 static const char *ColorSpaceName(reshade::api::color_space cs)
 {
@@ -840,18 +858,68 @@ static const char *ColorSpaceName(reshade::api::color_space cs)
 
 static reshade::api::color_space PresentColorSpace()
 {
-    return g_swapchain != nullptr ? g_swapchain->get_color_space() : reshade::api::color_space::unknown;
+    const HWND want = BoundRuntimeHwnd();
+    reshade::api::color_space cs = reshade::api::color_space::unknown;
+    AcquireSRWLockShared(&g_chain_lock);
+    const PresentChain *pick = nullptr;
+    for (int i = 0; i < g_chain_count; ++i)
+    {
+        const PresentChain &c = g_chains[i];
+        if (want != nullptr && c.hwnd == want) { pick = &c; break; }
+        // No runtime bound yet (or its window is not among these): the newest chain that is
+        // the game's own, and only failing that the newest of any kind, as before.
+        if (!c.foreign || pick == nullptr || pick->foreign) pick = &c;
+    }
+    if (pick != nullptr) cs = pick->sc->get_color_space();
+    ReleaseSRWLockShared(&g_chain_lock);
+    return cs;
 }
 
 static void OnInitSwapchain(reshade::api::swapchain *sc, bool)
 {
-    g_swapchain = sc;
-    Log("[feed] swapchain colour space: %s", ColorSpaceName(PresentColorSpace()));
+    PresentChain c = {};
+    c.sc   = sc;
+    c.hwnd = static_cast<HWND>(sc->get_hwnd());
+    if (c.hwnd == nullptr || !GetClassNameA(c.hwnd, c.wclass, sizeof(c.wclass))) strcpy_s(c.wclass, "(no window)");
+    c.foreign = strstr(c.wclass, "NvPresent") != nullptr || MgpuIsBridgeWindowClass(c.wclass);
+    const reshade::api::color_space own = sc->get_color_space();
+
+    AcquireSRWLockExclusive(&g_chain_lock);
+    int at = -1;
+    for (int i = 0; i < g_chain_count; ++i)
+        if (g_chains[i].sc == sc) { at = i; break; }   // a resize re-initialises the same object
+    if (at < 0)
+    {
+        if (g_chain_count == static_cast<int>(sizeof(g_chains) / sizeof(g_chains[0])))
+        {
+            // Full: drop the oldest rather than lose the newest, which is the likelier to be live.
+            memmove(&g_chains[0], &g_chains[1], sizeof(g_chains) - sizeof(g_chains[0]));
+            --g_chain_count;
+        }
+        at = g_chain_count++;
+    }
+    g_chains[at] = c;
+    const int count = g_chain_count;
+    ReleaseSRWLockExclusive(&g_chain_lock);
+
+    Log("[feed] swapchain %p (window class '%s'%s) colour space: %s; %d swapchain%s in this process, the feed reads: %s",
+        (void *)sc, c.wclass,
+        MgpuIsBridgeWindowClass(c.wclass) ? " -- MGPU Bridge's second-GPU window, not the game's"
+                                          : c.foreign ? " -- NVIDIA Smooth Motion's proxy, not the game's" : "",
+        ColorSpaceName(own), count, count == 1 ? "" : "s", ColorSpaceName(PresentColorSpace()));
 }
 
 static void OnDestroySwapchain(reshade::api::swapchain *sc, bool)
 {
-    if (g_swapchain == sc) g_swapchain = nullptr;
+    AcquireSRWLockExclusive(&g_chain_lock);
+    for (int i = 0; i < g_chain_count; ++i)
+        if (g_chains[i].sc == sc)
+        {
+            memmove(&g_chains[i], &g_chains[i + 1], sizeof(g_chains[0]) * static_cast<size_t>(g_chain_count - i - 1));
+            --g_chain_count;
+            break;
+        }
+    ReleaseSRWLockExclusive(&g_chain_lock);
 }
 
 // ---------------------------------------------------------------------------
@@ -2592,6 +2660,151 @@ static void DetectOptiScaler()
              "dlss5-feed.addon64.");
 }
 
+// MGPU Bridge beside this add-on -- the fourth neural consumer, and the odd one out (see
+// feed_mgpu.h; the host carries the same section). It runs the neural model on a SECOND GPU and
+// shows it in its own window, so nothing comes back into the game's frame: this add-on keeps
+// doing exactly what it does with no consumer at all (DLAA, written back), and MGPU helps itself
+// -- colour at reshade_finish_effects, depth from its own tap, and the motion vectors out of the
+// NGX evaluate this add-on makes, which its calibrator intercepts. D3D12 games only.
+//
+// ALPHA, and unverified end to end: MGPU refuses to arm without a second neural-capable GPU.
+static MgpuInfo g_mgpu;
+static bool     g_mgpu_loaded;    // ReShade has loaded it (it may load after us: polled from the runtime events)
+static bool     g_mgpu_sole;      // it is the only consumer here, so its four-handle budget is ours to protect
+static int      g_mgpu_creates;   // successful feature creates in this process
+
+static void DetectMgpu()
+{
+    char dir[MAX_PATH], exe_dir[MAX_PATH];
+    GetModuleFileNameA(g_self, dir, MAX_PATH);
+    if (char *s = strrchr(dir, '\\')) *(s + 1) = '\0';
+    GetModuleFileNameA(nullptr, exe_dir, MAX_PATH);
+    if (char *s = strrchr(exe_dir, '\\')) *(s + 1) = '\0';
+
+    if (!MgpuScan(dir, exe_dir, &g_mgpu))
+    {
+        Log("[feed] MGPU Bridge: not present");
+        return;
+    }
+    MgpuReportLayout(g_mgpu, "feed", "next to this add-on", &Log, &Warn);
+
+    const bool other = g_chicken_present || g_renodx_present || g_opti.present || g_toolkit_passes > 0 || g_toolkit_inert;
+    g_mgpu_sole = !other;
+    if (g_mgpu_sole)
+        Log("[feed] %s is the neural consumer (ALPHA -- this pairing has never been run end to end; it needs two RTX "
+            "GPUs). Nothing neural happens in the game's own frame: this add-on runs plain DLAA and writes it back, and "
+            "MGPU copies the motion vectors out of that evaluate, the frame after ReShade's effects, and depth from its "
+            "own %s. Its picture is in ITS window, on the second GPU's display. D3D12 games only. No warm-up "
+            "re-create: MGPU can latch %d feature handles per process and never lets one go.",
+            MGPU_LABEL, MGPU_TAP_FX, MGPU_HANDLE_SLOTS);
+    else
+        Warn("%s%s%s%sis ALSO next to this add-on, beside MGPU Bridge. That consumer runs the neural model on the game's "
+             "GPU and its result is written into the game's frame -- which is the frame MGPU then copies to the second "
+             "GPU and runs the neural model on AGAIN. They also disagree about where nvngx_dlssnr.dll must be (beside "
+             "the exe for that one, NOT beside it for MGPU). Keep exactly one: remove the other consumer's files, or "
+             "MGPU's, then fully restart the game.",
+             g_chicken_present ? "Deep Fried Chicken " : "", g_renodx_present ? "renodx-dlss5.addon64 " : "",
+             g_opti.present ? "OptiScaler " : "", (g_toolkit_passes > 0 || g_toolkit_inert) ? "alexs-toolkit.addon64 " : "");
+
+    if (GetModuleHandleW(L"sl.interposer.dll") != nullptr || GetModuleHandleW(L"sl.dlss.dll") != nullptr)
+        Warn("this game runs NVIDIA Streamline (sl.interposer.dll): it has DLSS of its own, and MGPU Bridge was built for "
+             "exactly that -- it takes the GAME's motion vectors from the game's own DLSS evaluate. With this feed also "
+             "evaluating, MGPU sees two features and copies from whichever evaluates first each frame. This project is "
+             "for games WITHOUT DLSS: use MGPU Bridge on its own here and remove dlss5-feed.addon64.");
+}
+
+// What can only be said once a runtime exists: the API, what the preset's depth definitions are,
+// whether ReShade has loaded MGPU yet. Called from the runtime events; every line is said once.
+static void MgpuRuntimeChecks(reshade::api::effect_runtime *rt)
+{
+    if (!g_mgpu.present || rt == nullptr) return;
+
+    if (!g_mgpu_loaded && MgpuLoadedModule(g_mgpu) != nullptr)
+    {
+        g_mgpu_loaded = true;
+        Log("[feed] %s is loaded (%s). Its calibrator installs at the first swapchain; its own lines in ReShade.log are "
+            "prefixed [MGPU] -- \"[MGPU][R134] GAME CreateFeature: id=1\" is it seeing this add-on's create, and "
+            "eval-copies on its [R101] line is the count of vector copies taken from this add-on's evaluates.",
+            MGPU_LABEL, g_mgpu.addon);
+    }
+
+    static bool said_api = false;
+    if (!said_api && rt->get_device()->get_api() != reshade::api::device_api::d3d12)
+    {
+        said_api = true;
+        Warn("MGPU Bridge is D3D12-only and this game is not D3D12: it will never arm here, but it still patches the "
+             "import table of every module in the process. The feed itself is unaffected (plain DLAA, no neural "
+             "rendering). Remove %s from this game, or use renodx-dlss5 / Deep Fried Chicken / OptiScaler DLSS-NR. "
+             "(32-bit games reach MGPU through the 64-bit helper instead: see README.)", g_mgpu.addon);
+    }
+
+    static bool said_mode = false;
+    if (!said_mode && g_cfg.mode != 2)
+    {
+        said_mode = true;
+        Warn("mode=%d: no NGX evaluate is made, so MGPU Bridge gets no motion vectors from this add-on. It needs mode=2.",
+             g_cfg.mode);
+    }
+
+    // MGPU's tap copies the DEPTH semantic raw, and DepthInverted in mgpu.ini is what it tells the
+    // neural model about it. This add-on tells DLSS the same thing from depth_inverted / the
+    // preset. The two should agree; when they do not, one of the two models is being lied to.
+    const bool inverted = g_cfg.depth_inverted >= 0 ? g_cfg.depth_inverted != 0 : g.depth_reversed;
+    static int said_depth = -1;
+    if (g.handles_ok && g_mgpu.ini.found && (g_mgpu.ini.depth_inverted != 0) != inverted && said_depth != (inverted ? 1 : 0))
+    {
+        said_depth = inverted ? 1 : 0;
+        Warn("depth direction disagrees: this add-on tells DLSS depth is %s (depth_inverted=%d, "
+             "RESHADE_DEPTH_INPUT_IS_REVERSED=%d), mgpu.ini has DepthInverted=%d. Both read the same depth buffer, so "
+             "one is wrong. If the DLSS5_Feed depth debug view looks right, set DepthInverted=%d in mgpu.ini.",
+             inverted ? "reversed" : "not reversed", g_cfg.depth_inverted, g.depth_reversed ? 1 : 0,
+             g_mgpu.ini.depth_inverted, inverted ? 1 : 0);
+    }
+
+    static bool said_uv = false;
+    if (!said_uv && g.handles_ok)
+    {
+        char v[32] = {};
+        bool flipped = false, scaled = false;
+        if (rt->get_preprocessor_definition("RESHADE_DEPTH_INPUT_IS_UPSIDE_DOWN", v)) flipped = atoi(v) != 0;
+        static const char *const kUnit[] = { "RESHADE_DEPTH_INPUT_X_SCALE", "RESHADE_DEPTH_INPUT_Y_SCALE" };
+        static const char *const kZero[] = { "RESHADE_DEPTH_INPUT_X_OFFSET", "RESHADE_DEPTH_INPUT_Y_OFFSET",
+                                             "RESHADE_DEPTH_INPUT_X_PIXEL_OFFSET", "RESHADE_DEPTH_INPUT_Y_PIXEL_OFFSET" };
+        for (const char *k : kUnit) { v[0] = '\0'; if (rt->get_preprocessor_definition(k, v) && v[0] != '\0' && atof(v) != 1.0) scaled = true; }
+        for (const char *k : kZero) { v[0] = '\0'; if (rt->get_preprocessor_definition(k, v) && v[0] != '\0' && atof(v) != 0.0) scaled = true; }
+        if (flipped || scaled)
+        {
+            said_uv = true;
+            Warn("this preset corrects the depth buffer's placement (%s%s%s). DLSS5_Feed.fx applies those corrections; "
+                 "MGPU Bridge's depth tap reads the DEPTH semantic raw and ignores them, so on the second GPU depth "
+                 "will not line up with colour and the motion vectors. Nothing on this side can fix that.",
+                 flipped ? "RESHADE_DEPTH_INPUT_IS_UPSIDE_DOWN" : "", flipped && scaled ? ", " : "",
+                 scaled ? "a RESHADE_DEPTH_INPUT_ scale or offset" : "");
+        }
+    }
+
+    static bool said_sm = false;
+    if (!said_sm && g_smooth_motion)
+    {
+        said_sm = true;
+        Warn("NVIDIA Smooth Motion is active beside MGPU Bridge. Both add a swapchain, and ReShade numbers its config "
+             "files by creation order (ReShade2.ini, ReShade3.ini, ...), so MGPU's window may not be the one that gets "
+             "ReShade2.ini. If effects are drawn over MGPU's output, disable Smooth Motion for this game.");
+    }
+}
+
+// Every successful create is a handle MGPU's calibrator latches, and it has room for four.
+static void MgpuNoteCreate()
+{
+    if (!g_mgpu.present) return;
+    if (++g_mgpu_creates == MGPU_HANDLE_SLOTS + 1)
+        Warn("this is feature create number %d in this process. MGPU Bridge latches the first %d scene-feature handles "
+             "it sees and never releases one; unless NGX happens to reuse an old handle's address, evaluates of this "
+             "feature are skipped by its filter (eval-skips climbs on its [R101] line, eval-copies stops) and its "
+             "motion vectors freeze. Resolution changes and device losses are what cost creates. Restart the game to "
+             "get them back.", g_mgpu_creates, MGPU_HANDLE_SLOTS);
+}
+
 // Called from the __except handlers with the faulting context still intact.
 static void NoteNgxFault(const char *what, EXCEPTION_POINTERS *ep)
 {
@@ -2602,7 +2815,8 @@ static void NoteNgxFault(const char *what, EXCEPTION_POINTERS *ep)
     Log("[feed] %s raised 0x%08X%s (caught; nothing submitted)", what, code, detail);
     if (stack[0] != '\0') Log("[feed] %s fault stack, by module (innermost first): %s", what, stack);
     if (ContainsNoCase(stack, g_renodx_file) || ContainsNoCase(stack, DFC_ADDON_FILENAME) ||
-        ContainsNoCase(stack, g_opti.module) || ContainsNoCase(stack, OPTI_FORWARDER))
+        ContainsNoCase(stack, g_opti.module) || ContainsNoCase(stack, OPTI_FORWARDER) ||
+        (g_mgpu.present && ContainsNoCase(stack, g_mgpu.addon)))   // its hooks wrap every evaluate, and take a std::mutex inside
         g_ngx_poisoned = true;
 }
 
@@ -2640,6 +2854,7 @@ static NVSDK_NGX_Result SafeCreateDLSS(NVSDK_NGX_DLSS_Create_Params *cp, DWORD *
     const NVSDK_NGX_Result r = CreateDLSSGuarded(cp, code);
     QueryPerformanceCounter(&b);
     g_last_create_ticks = b.QuadPart - a.QuadPart;
+    if (*code == 0 && NVSDK_NGX_SUCCEED(r)) MgpuNoteCreate();
     return r;
 }
 
@@ -2655,6 +2870,7 @@ static bool WarmupRebuildDue(UINT64 n)
 {
     if (g.warmup_done) return false;
     if (g_opti.routed) return false;   // OptiScaler is the callee: nothing arms late, nothing to re-create for
+    if (g_mgpu_sole) return false;     // MGPU Bridge: nothing to re-arm, and a re-create burns one of its four handle slots
     if (g_chicken_present)
     {
         if (!g_chicken_created_unarmed) return false;   // Chicken saw the create
@@ -7977,6 +8193,7 @@ struct RuntimeSlot
     void                          *dev;         // native device, for the log
     char                           wclass[48];  // window class of the swapchain's HWND
     bool                           proxy;       // Smooth Motion's invisible proxy swapchain
+    bool                           bridge;      // MGPU Bridge's second-GPU window: another adapter, never the game
     ULONGLONG                      last_resolve; // GetTickCount64 of the last find_technique from the render path
 };
 static RuntimeSlot g_runtimes[6];
@@ -8008,9 +8225,16 @@ static RuntimeSlot *TrackRuntime(reshade::api::effect_runtime *rt)
         if (hwnd != nullptr && !GetClassNameA(hwnd, s->wclass, sizeof(s->wclass))) s->wclass[0] = '\0';
         if (hwnd == nullptr) strcpy_s(s->wclass, "(no window)");
         s->proxy = strstr(s->wclass, "NvPresent") != nullptr;
+        s->bridge = MgpuIsBridgeWindowClass(s->wclass);
     }
     s->technique = rt->find_technique(kEffectFile, kTechnique);
     return s;
+}
+
+static HWND BoundRuntimeHwnd()
+{
+    reshade::api::effect_runtime *rt = g.runtime;
+    return rt != nullptr ? static_cast<HWND>(rt->get_hwnd()) : nullptr;
 }
 
 static void UntrackRuntime(reshade::api::effect_runtime *rt)
@@ -8152,9 +8376,16 @@ static void OnInitEffectRuntime(reshade::api::effect_runtime *rt)
     if (++inits <= 8)
         Log("[feed] effect runtime %p initialised (device %p, window class '%s'%s; %d runtime%s in this process)",
             (void *)rt, slot->dev, slot->wclass,
-            slot->proxy ? " -- NVIDIA Smooth Motion's proxy swapchain, not the game's" : "",
+            slot->proxy ? " -- NVIDIA Smooth Motion's proxy swapchain, not the game's"
+                        : slot->bridge ? " -- MGPU Bridge's second-GPU window, not the game's; never fed" : "",
             g_runtime_count, g_runtime_count == 1 ? "" : "s");
     else if (inits == 9) Log("[feed] (further runtime init/destroy messages suppressed)");
+
+    // MGPU Bridge's window lives on the OTHER adapter and shows the neural output. Feeding it
+    // would open a second NGX session on the GPU MGPU reserves for the neural model, and every
+    // re-init of it would hold the game's feature create for a fresh grace period. It is tracked
+    // (so the count in the log is honest) and otherwise left completely alone.
+    if (slot->bridge) return;
 
     // Bind: the first runtime, or a re-init of the bound one. Another runtime only takes
     // over when the bound one has no DLSS5_Feed and this one does; otherwise it is
@@ -8179,6 +8410,7 @@ static void OnInitEffectRuntime(reshade::api::effect_runtime *rt)
     // The driver injects NvPresent64.dll around swapchain creation, which can be after
     // this add-on attached -- so this is the re-check DllMain's first look cannot be.
     DetectSmoothMotion();
+    MgpuRuntimeChecks(rt);   // after DetectSmoothMotion: one of its notes is about the two together
     // Not in DllMain: this LoadLibrary()s, which under the loader lock can deadlock.
     DetectStaleD3DCompiler();
     // Same reason, plus a second one: resolving dbghelp HERE is what makes a crash dump
@@ -8226,6 +8458,7 @@ static void OnReloadedEffects(reshade::api::effect_runtime *rt)
 {
     if (!g_cfg.enabled) return;
     RuntimeSlot *slot = TrackRuntime(rt);
+    if (slot->bridge) return;   // MGPU Bridge's own runtime: see OnInitEffectRuntime
     if (rt == g.runtime || g.runtime == nullptr || (g.technique.handle == 0 && slot->technique.handle != 0))
     {
         if (g.runtime != nullptr && rt != g.runtime)
@@ -8236,6 +8469,7 @@ static void OnReloadedEffects(reshade::api::effect_runtime *rt)
         // history re-fills -- discard the DLSS history built on those frames instead of
         // smearing it forward (Space Engineers reload bursts).
         g.need_reset = true;
+        MgpuRuntimeChecks(rt);   // the depth definitions are only readable once the effects exist
     }
 }
 
@@ -8290,6 +8524,19 @@ static void OnRenderTechnique(reshade::api::effect_runtime *rt, reshade::api::ef
         // Still not this runtime's DLSS5_Feed: it is one of the other techniques in the
         // preset, which arrive here constantly and are nothing to report.
         if (slot == nullptr || slot->technique.handle == 0 || technique.handle != slot->technique.handle) return;
+        if (slot->bridge)
+        {
+            // Only reachable when gpu1.ini was edited to enable DLSS5_Feed on MGPU's window.
+            static bool said_bridge = false;
+            if (!said_bridge)
+            {
+                said_bridge = true;
+                Warn("DLSS5_Feed is enabled on MGPU Bridge's own window (its preset is gpu1.ini). That window shows the "
+                     "second GPU's neural output; there is nothing there to feed, and it is ignored. Disable DLSS5_Feed "
+                     "in gpu1.ini -- MGPU ships that preset empty on purpose.");
+            }
+            return;
+        }
         const ULONGLONG now = GetTickCount64();
         if (g.technique.handle != 0 && now - g_bound_last_render < 1000)
         {
@@ -8473,6 +8720,28 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
                                "A second neural consumer is ALSO present -- OptiScaler captures its NGX calls too.\n"
                                "Keep exactly one (remove the other's files, or the OptiScaler set), then fully restart.");
         ImGui::TextDisabled("OptiScaler's own menu: Insert (its \"DLSS Neural Rendering\" section is the last one).");
+    }
+    if (g_mgpu.present)
+    {
+        const bool d3d12 = rt != nullptr && rt->get_device()->get_api() == reshade::api::device_api::d3d12;
+        const bool bad = !g_mgpu_sole || !d3d12 || !MgpuIniTakesEvalVectors(g_mgpu.ini) || g_mgpu.snippet_beside_exe ||
+                         !g_mgpu.snippet_private || g_mgpu_creates > MGPU_HANDLE_SLOTS || g_cfg.mode != 2;
+        char line[512];
+        _snprintf_s(line, sizeof(line), _TRUNCATE, "Neural consumer: %s (ALPHA, second GPU) -- %s; feature creates %d of %d%s%s%s%s",
+                    MGPU_LABEL, g_mgpu_loaded ? "loaded" : "not loaded by ReShade yet", g_mgpu_creates, MGPU_HANDLE_SLOTS,
+                    d3d12 ? "" : "; NOT A D3D12 GAME: it cannot arm here",
+                    MgpuIniTakesEvalVectors(g_mgpu.ini) ? "" : "; mgpu.ini does not take vectors from the evaluate (Calib/MVec/MvecFromEval)",
+                    g_mgpu.snippet_beside_exe ? "; nvngx_dlssnr.dll is beside the exe (its INSTALL PROBLEM)"
+                                              : g_mgpu.snippet_private ? "" : "; nvngx_dlssnr.dll is not in mgpu\\",
+                    g_mgpu_creates > MGPU_HANDLE_SLOTS ? "; ITS HANDLE SLOTS ARE FULL -- restart the game" : "");
+        if (bad) ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.3f, 1.0f), "%s", line);
+        else     ImGui::TextUnformatted(line);
+        if (!g_mgpu_sole)
+            ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.3f, 1.0f),
+                               "A second neural consumer is ALSO present -- the neural model would run on both GPUs, one on top of the other.\n"
+                               "Keep exactly one (remove the other's files, or MGPU Bridge's), then fully restart.");
+        ImGui::TextDisabled("Its picture is in its own window on the second GPU's display; its panel is in ReShade's Add-ons tab.\n"
+                            "In ReShade.log, eval-copies on its [MGPU][R101] line counts vectors taken from this add-on.");
     }
     if (g_d3dcompiler_stale)
         ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.3f, 1.0f),
@@ -8701,6 +8970,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         DetectToolkitAddon();
         DetectChickenAddon(g_cfg.warmup_rebuild);   // after DetectRenodxAddon: it needs g_renodx_present
         DetectOptiScaler();                          // after all three: it warns when any of them is beside it
+        DetectMgpu();                                // after all four: same reason
         // Usually too early to see it (the driver injects it around swapchain creation);
         // OnInitEffectRuntime re-checks. Worth one look here for the case where ReShade
         // itself was loaded late.

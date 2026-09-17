@@ -58,6 +58,13 @@
     Omitted, the script asks at the start; with -Yes and no choice given it takes RenoDX,
     which is the only one it can fetch unattended.
 
+    MGPU (ALPHA) is MGPU Bridge, which runs the neural model on a SECOND RTX GPU in its own
+    window. This script never downloads it and never edits its files; it is selected
+    automatically when its add-on is already in the consumer folder (the game folder, or
+    host64 for a 32-bit game), and then no other consumer is installed and nvngx_dlssnr.dll
+    goes into its mgpu subfolder instead of beside the exe -- which is where MGPU needs it
+    and where every other consumer must NOT have it.
+
 .PARAMETER MvProvider
     DLSS5_MV_PROVIDER value: 3 (LumeniteFX Kernel, default) or 4 (LumeniteFX QuantMotion).
     Both come from the same LumeniteFX download. Other providers are not automated.
@@ -123,7 +130,7 @@ param(
     [ValidateSet('Auto', 'D3D', 'Vulkan', 'OpenGL', 'D3D9', 'D3D8')]
     [string] $Api = 'Auto',
 
-    [ValidateSet('Ask', 'DFC', 'RenoDX', 'OptiScaler')]
+    [ValidateSet('Ask', 'DFC', 'RenoDX', 'OptiScaler', 'MGPU')]
     [string] $Consumer = 'Ask',
 
     [ValidateSet(3, 4)]
@@ -1485,7 +1492,7 @@ if ($Consumer -eq 'Ask') {
         }
     }
 }
-$consumerLabel = switch ($Consumer) { 'DFC' { 'Deep Fried Chicken' } 'RenoDX' { 'RenoDX DLSS 5' } default { 'OptiScaler DLSS-NR' } }
+$consumerLabel = switch ($Consumer) { 'DFC' { 'Deep Fried Chicken' } 'RenoDX' { 'RenoDX DLSS 5' } 'MGPU' { 'MGPU Bridge (ALPHA; you install it yourself)' } default { 'OptiScaler DLSS-NR' } }
 Write-Chunk '  Neural  ' 'DarkGray' -NoNewline
 Write-Host $consumerLabel
 if ($LocalFiles) {
@@ -1722,6 +1729,26 @@ if ($is32) { $consumerDir = $hostDir; $consumerWhere = 'host64\' } else { $consu
 $shaderDir  = Join-Safe $gameDir 'reshade-shaders\Shaders'
 $textureDir = Join-Safe $gameDir 'reshade-shaders\Textures'
 
+# MGPU Bridge (maohgad-web/Neural-coprocessor, ALPHA support): the neural model on a SECOND GPU.
+# Never downloaded and never edited by this script. But if it is already here it IS the consumer:
+# installing another one beside it would run the model twice, and the nvngx_dlssnr.dll every other
+# consumer needs beside the exe is exactly what MGPU reports as INSTALL PROBLEM.
+$mgpuPattern = '*mgpu_bridge*.addon64'
+$mgpuHere    = Find-FileIn $consumerDir $mgpuPattern
+$mgpuStray   = $null
+if ($is32) { $mgpuStray = Find-FileIn $gameDir $mgpuPattern }
+if (($mgpuHere -or $mgpuStray) -and $Consumer -ne 'MGPU') {
+    Report -Status 'Warn' -Text ('MGPU Bridge is already installed here, so it is the neural consumer; ' + $consumerLabel + ' will NOT be installed.') `
+           -Detail 'Exactly one consumer. To use another one instead, remove MGPU Bridge''s files (its .addon64, mgpu.ini, the mgpu folder, ReShade2.ini, gpu1.ini) and run this again.'
+    $Consumer = 'MGPU'
+    $consumerLabel = 'MGPU Bridge (ALPHA; you install it yourself)'
+}
+elseif ($Consumer -eq 'MGPU' -and -not $mgpuHere -and -not $mgpuStray) {
+    Report -Status 'Warn' -Text ('MGPU Bridge was chosen, but its add-on is not in ' + $consumerWhere + '.') `
+           -Detail 'This script does not download it. Everything else is installed now; nothing neural happens until it is there.' `
+           -Manual ('Unpack the MGPU Bridge release zip (github.com/maohgad-web/Neural-coprocessor/releases) into ' + $consumerDir + ', then run this again so nvngx_dlssnr.dll lands in its mgpu folder.')
+}
+
 # ---------------------------------------------------------------------------------------
 # 2. GPU
 # ---------------------------------------------------------------------------------------
@@ -1854,7 +1881,7 @@ elseif ($Consumer -eq 'RenoDX') {
                -Detail ('Get it from the RenoDX Discord (' + $Sources.RenoDxDiscord + ') or the RHI installer, and pass it with -RenoDxAddon or via -LocalFiles.')
     }
 }
-else {
+elseif ($Consumer -eq 'OptiScaler') {
     # OptiScaler_DLSSNR ships as a GitHub release (about 130 MB; nvngx_dlssnr.dll is not in it).
     # Newest asset, the way the feeder's own release is found above; offline, the newest cached copy.
     if ($OptiScalerZip) {
@@ -2519,6 +2546,62 @@ elseif ($Consumer -eq 'RenoDX') {
         }
     }
 }
+elseif ($Consumer -eq 'MGPU') {
+    # Nothing of MGPU's is downloaded or edited. What this does: for a 32-bit game, bring a set that
+    # was unpacked beside the game exe (where nothing can load it) into host64\; then make sure no
+    # other consumer is live beside it.
+    if ($is32 -and $mgpuStray -and -not $mgpuHere) {
+        if ($Yes -or (Confirm-Step ('Move MGPU Bridge''s files from the game folder into host64? (a 32-bit game cannot load them; the 64-bit helper can)'))) {
+            try {
+                New-DirSafe $consumerDir
+                foreach ($n in @($mgpuPattern, 'mgpu.ini')) {
+                    foreach ($f in (Find-FilesIn $gameDir $n)) { Move-Item -LiteralPath $f.FullName -Destination (Join-Safe $consumerDir $f.Name) -Force }
+                }
+                $mgpuSub = Join-Safe $gameDir 'mgpu'
+                if ((Test-DirHere $mgpuSub) -and -not (Test-DirHere (Join-Safe $consumerDir 'mgpu'))) { Move-Item -LiteralPath $mgpuSub -Destination (Join-Safe $consumerDir 'mgpu') -Force }
+                # ReShade2.ini / gpu1.ini only when they are MGPU's own pair: a game folder can hold a
+                # ReShade2.ini of ReShade's making, and that one stays where it is.
+                $rs2 = Find-FileIn $gameDir 'ReShade2.ini'
+                $rs2Text = $null
+                if ($rs2) { $rs2Text = Read-TextSafe $rs2 }
+                if ($rs2Text -and $rs2Text -match '(?im)^\s*PresetPath\s*=.*gpu1\.ini') {
+                    Move-Item -LiteralPath $rs2 -Destination (Join-Safe $consumerDir 'ReShade2.ini') -Force
+                    $g1 = Find-FileIn $gameDir 'gpu1.ini'
+                    if ($g1) { Move-Item -LiteralPath $g1 -Destination (Join-Safe $consumerDir 'gpu1.ini') -Force }
+                }
+                # The tap is COPIED: the helper needs it, and leaving it in the game's shader folder is harmless.
+                $tap = Find-FileUnder (Join-Safe $gameDir 'reshade-shaders') 'mgpu_depth_tap.fx'
+                if (-not $tap) { $tap = Find-FileIn $gameDir 'mgpu_depth_tap.fx' }
+                if ($tap -and -not (Find-FileIn $consumerDir 'mgpu_depth_tap.fx')) { Copy-Item -LiteralPath $tap -Destination (Join-Safe $consumerDir 'mgpu_depth_tap.fx') -Force }
+                $mgpuHere = Find-FileIn $consumerDir $mgpuPattern
+                Report -Status 'Done' -Text 'MGPU Bridge moved from the game folder into host64\.' -Detail 'A 32-bit game cannot load a 64-bit D3D12 add-on; the 64-bit helper is a D3D12 process and can. mgpu_depth_tap.fx was copied beside it.'
+            }
+            catch { Report -Status 'Fail' -Text 'MGPU Bridge could not be moved into host64\.' -Detail $_.Exception.Message -Manual ('Move its .addon64, mgpu.ini, the mgpu folder, ReShade2.ini and gpu1.ini into ' + $consumerDir + ', and copy mgpu_depth_tap.fx there too.') }
+        }
+        else { Report -Status 'Warn' -Text 'MGPU Bridge left beside the 32-bit game exe, where nothing can load it.' -Manual ('Move its files into ' + $consumerDir) }
+    }
+    elseif ($is32 -and $mgpuStray -and $mgpuHere) {
+        Disable-Conflict -Path $mgpuStray -Why 'a 64-bit add-on beside a 32-bit exe is never loaded; the copy in host64\ is the one that runs'
+    }
+
+    Disable-Conflict -Path (Find-FileIn $consumerDir 'deep-fried-chicken.addon64') -Why 'exactly one neural consumer: MGPU Bridge is installed here'
+    Disable-Conflict -Path (Find-FileIn $consumerDir 'deep-fried-chicken-nvngx.dll') -Why 'Chicken''s private NGX bridge has no business beside MGPU Bridge'
+    foreach ($f in (Find-FilesIn $consumerDir 'renodx-dlss5*.addon64')) {
+        Disable-Conflict -Path $f.FullName -Why 'exactly one neural consumer: MGPU Bridge is installed here'
+    }
+    Disable-Conflict -Path (Find-FileIn $consumerDir 'alexs-toolkit.addon64') -Why 'a cascade over the RenoDX add-on; with MGPU Bridge there is nothing for it to attach to'
+    Disable-Conflict -Path (Find-OptiScalerDll $consumerDir) -Why 'OptiScaler captures every nvngx load in the process, MGPU Bridge''s included'
+
+    if ($mgpuHere) {
+        Report -Status 'Ok' -Text ([IO.Path]::GetFileName($mgpuHere) + ' is the neural consumer (ALPHA; untested end to end -- it needs a second RTX GPU).') -Detail ('in ' + $consumerWhere + '. Its own files are left exactly as they are.')
+        if (-not $is32 -and -not (Find-FileUnder (Join-Safe $gameDir 'reshade-shaders') 'mgpu_depth_tap.fx') -and -not (Find-FileIn $gameDir 'mgpu_depth_tap.fx')) {
+            Report -Status 'Warn' -Text 'mgpu_depth_tap.fx was not found under reshade-shaders\.' -Manual 'Copy it from MGPU Bridge''s release zip into reshade-shaders\Shaders\.'
+        }
+        if ($is32 -and -not (Find-FileIn $consumerDir 'mgpu_depth_tap.fx') -and -not (Find-FileUnder (Join-Safe $consumerDir 'reshade-shaders') 'mgpu_depth_tap.fx')) {
+            Report -Status 'Warn' -Text 'mgpu_depth_tap.fx is not in host64\.' -Detail 'The helper''s own ReShade has to compile it, or MGPU never sees a frame there.' -Manual ('Copy it from MGPU Bridge''s release zip into ' + $consumerDir)
+        }
+    }
+}
 else {
     Disable-Conflict -Path (Find-FileIn $consumerDir 'deep-fried-chicken.addon64') -Why 'exactly one neural consumer: you chose OptiScaler, and it captures Chicken''s own nvngx loads'
     Disable-Conflict -Path (Find-FileIn $consumerDir 'deep-fried-chicken-nvngx.dll') -Why 'Chicken''s private NGX bridge ends in nvngx.dll, and OptiScaler''s hook would hand it OptiScaler'
@@ -2620,6 +2703,22 @@ else {
 # NVIDIA runtimes
 foreach ($pair in @(@{ N = 'nvngx_dlssnr.dll'; P = $dlssNrPath }, @{ N = 'nvngx_dlss.dll'; P = $dlssPath })) {
     $to = Join-Safe $consumerDir $pair.N
+    if ($Consumer -eq 'MGPU' -and $pair.N -eq 'nvngx_dlssnr.dll') {
+        # MGPU Bridge must hold the ONLY copy of the neural model, in a subfolder beside its add-on, so
+        # that NGX binds it to the second GPU. A copy beside the exe is its red INSTALL PROBLEM.
+        $besideExe = $to
+        $mgpuDir = Join-Safe $consumerDir 'mgpu'
+        $to = Join-Safe $mgpuDir $pair.N
+        if (Test-FileHere $besideExe) {
+            try {
+                New-DirSafe $mgpuDir
+                if (Test-FileHere $to) { Remove-Item -LiteralPath $besideExe -Force; Report -Status 'Done' -Text 'nvngx_dlssnr.dll removed from beside the exe (MGPU Bridge already has its own in mgpu).' }
+                else { Move-Item -LiteralPath $besideExe -Destination $to -Force; Report -Status 'Done' -Text 'nvngx_dlssnr.dll moved from beside the exe into mgpu.' -Detail 'Beside the exe is where every other consumer wants it and where MGPU Bridge reports INSTALL PROBLEM.' }
+            }
+            catch { Report -Status 'Warn' -Text 'nvngx_dlssnr.dll is beside the exe and could not be moved.' -Detail $_.Exception.Message -Manual ('Move ' + $besideExe + ' into ' + $mgpuDir) }
+        }
+        if ($pair.P) { New-DirSafe $mgpuDir }
+    }
     if (-not $pair.P) { continue }
     if ((Test-FileHere $to) -and -not $Force) {
         $have = Get-Sha256 $to
@@ -2845,6 +2944,12 @@ if ($Consumer -eq 'DFC') {
 }
 elseif ($Consumer -eq 'RenoDX') {
     $steps += 'Turn on neural rendering in the DLSS 5 Neural Rendering add-on panel.'
+}
+elseif ($Consumer -eq 'MGPU') {
+    $steps += 'MGPU Bridge shows its result in ITS OWN window on the second GPU''s display; this game''s own picture stays plain DLAA. It needs two RTX GPUs and two displays, one per card.'
+    if ($is32) { $steps += 'host64\dlss5-feed-host.log should say "frame mode: swapchain is now <game resolution>" and, every 1800 frames, a "frame mode (running)" line whose finish_effects count is not zero.' }
+    else { $steps += 'This only works in a Direct3D 12 game. dlss5-feed.log says "MGPU Bridge is the neural consumer"; in ReShade.log, eval-copies on the [MGPU][R101] line should climb.' }
+    $steps += 'ALPHA: this pairing has never been run end to end by this project. Please report what ReShade.log and dlss5-feed.log say.'
 }
 else {
     if ($is32) { $steps += 'OptiScaler''s menu lives in the host64 helper: open the ReShade overlay > Add-ons > DLSS 5 Feed, press "Show the DLSS 5 panel in-game", then press Insert. "DLSS Neural Rendering" is its last section; the pass is already switched on.' }

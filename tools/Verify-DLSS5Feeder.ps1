@@ -633,6 +633,23 @@ function Get-IniValue
     return $value
 }
 
+# mgpu.ini as MGPU Bridge itself reads it (its mgpu_ini_parser.hpp): no sections -- the [MGPU]
+# header is decoration -- the FIRST line-start "Key=" wins, and ';' or '#' comments a whole line.
+# Returns $null for an absent key, which matters: several of its compiled defaults are not the
+# shipped values (MVec and MvecFromEval default to 0).
+function Get-MgpuIniValue
+{
+    param([string] $Path, [string] $Key)
+    $lines = Read-LinesSafe $Path
+    if ($null -eq $lines) { return $null }
+    $rx = '^[ \t]*' + [regex]::Escape($Key) + '=(.*)$'
+    foreach ($ln in $lines) {
+        if ($ln -match '^[ \t]*[;#]') { continue }
+        if ($ln -cmatch $rx) { return $Matches[1].Trim() }
+    }
+    return $null
+}
+
 # One NAME=VALUE out of a ReShade PreprocessorDefinitions list (comma separated).
 function Get-PreprocessorDefinition
 {
@@ -1164,9 +1181,14 @@ foreach ($n in @('winmm.dll', 'version.dll', 'dbghelp.dll', 'winhttp.dll', 'wini
     if (Get-BinaryMarker -Path $p -Pattern 'OptiScaler\.ini') { $optiDll = $p; break }
 }
 
+# MGPU Bridge (maohgad-web/Neural-coprocessor): the neural model on a SECOND GPU, in its own
+# window. Its add-on's file name is load-bearing on its side (nvngx.dll_mgpu_bridge.addon64), so
+# match the part that does not change.
+$mgpuAddon = Find-FileIn $consumerDir '*mgpu_bridge*.addon64'
+
 if ($gameBits -eq 32) {
     # A 64-bit add-on beside a 32-bit exe is the single most common 32-bit deploy mistake.
-    foreach ($n in @('deep-fried-chicken.addon64', 'renodx-dlss5*.addon64', 'alexs-toolkit.addon64')) {
+    foreach ($n in @('deep-fried-chicken.addon64', 'renodx-dlss5*.addon64', 'alexs-toolkit.addon64', '*mgpu_bridge*.addon64')) {
         $stray = Find-FileIn $gameDir $n
         if ($stray) {
             $n = [IO.Path]::GetFileName($stray)   # the versioned name, not the pattern
@@ -1204,8 +1226,12 @@ $consumers = @()
 if ($dfcAddon)  { $consumers += 'Deep Fried Chicken' }
 if ($renoAddon) { $consumers += 'RenoDX DLSS 5' }
 if ($optiDll)   { $consumers += ('OptiScaler (' + [IO.Path]::GetFileName($optiDll) + ')') }
+if ($mgpuAddon) { $consumers += 'MGPU Bridge' }
 if ($consumers.Count -ge 2) {
-    if ($optiDll) {
+    if ($mgpuAddon) {
+        $why = 'MGPU Bridge runs the neural model on a second GPU, on a copy of the finished frame. Any other consumer has already run it on the first GPU and written the result into that frame, so the model runs twice, one on top of the other. They also disagree about nvngx_dlssnr.dll: the others need it beside the exe, MGPU reports INSTALL PROBLEM when it is there. For a 32-bit game the helper only enters its MGPU frame mode when MGPU is alone in host64\.'
+    }
+    elseif ($optiDll) {
         $why = 'OptiScaler captures every nvngx load in the process: another consumer beside it either talks to OptiScaler instead of the driver (Chicken''s own deep-fried-chicken-nvngx.dll ends in nvngx.dll) or runs its neural pass a second time inside OptiScaler''s DLSS backend.'
     }
     else {
@@ -1291,6 +1317,70 @@ elseif ($optiDll) {
         }
     }
 }
+elseif ($mgpuAddon) {
+    $mgpuName = [IO.Path]::GetFileName($mgpuAddon)
+    Report -Status 'Warn' -Text ('MGPU Bridge present as ' + $mgpuName + ' (ALPHA support; second-GPU neural rendering).') `
+           -Detail ('in ' + $consumerWhere + '. This pairing has never been run end to end by this project: MGPU refuses to arm without a second neural-capable (RTX) GPU. Nothing neural appears in the game''s own picture -- MGPU shows its result in its own window, on the second GPU''s display.')
+    if ($gameBits -ne 32) {
+        Report -Status 'Na' -Text 'MGPU Bridge is D3D12-only.' `
+               -Detail 'In a 64-bit Direct3D 11, Vulkan or OpenGL game it never arms (but still patches every module''s import table). dlss5-feed.log says which API the game turned out to be.'
+    }
+    if (@(Find-FilesIn $consumerDir '*mgpu_bridge*.addon64').Count -gt 1) {
+        Report -Status 'Fail' -Text 'More than one MGPU Bridge add-on file is present.' `
+               -Detail 'ReShade loads every one of them; each opens its own window and patches every import table in the process.' `
+               -Action ('Keep one in ' + $consumerDir)
+    }
+    $mgpuIni = Find-FileIn $consumerDir 'mgpu.ini'
+    if ($mgpuIni) {
+        $calib = Get-MgpuIniValue -Path $mgpuIni -Key 'Calib'
+        $mvec  = Get-MgpuIniValue -Path $mgpuIni -Key 'MVec'
+        $mfe   = Get-MgpuIniValue -Path $mgpuIni -Key 'MvecFromEval'
+        $shown = 'Calib=' + $(if ($null -ne $calib) { $calib } else { '(absent: 2)' }) + ' MVec=' + $(if ($null -ne $mvec) { $mvec } else { '(absent: 0)' }) + ' MvecFromEval=' + $(if ($null -ne $mfe) { $mfe } else { '(absent: 0)' })
+        $calibOff = ($null -ne $calib) -and ($calib -match '^0')
+        $mvecReal = ($null -ne $mvec) -and ($mvec -match '^(3|[rR])')
+        $mfeOn    = ($null -ne $mfe) -and ($mfe -match '^[12]')
+        if ($calibOff -or -not $mvecReal -or -not $mfeOn) {
+            Report -Status 'Fail' -Text ('mgpu.ini: ' + $shown + ' -- MGPU takes no motion vectors from the feed.') `
+                   -Detail 'Its only source of vectors here is the NGX evaluate the feeder makes, which its calibrator intercepts. That needs Calib=1 or 2, MVec=3 and MvecFromEval=1 or 2 (its shipped values are 2, 3, 2). An ABSENT MVec or MvecFromEval means 0.' `
+                   -Action 'Edit mgpu.ini (the feeder never writes to it) and restart the game.'
+        }
+        else {
+            Report -Status 'Ok' -Text ('mgpu.ini: ' + $shown + ' (it copies motion vectors out of the feeder''s evaluate).')
+        }
+        $di = Get-MgpuIniValue -Path $mgpuIni -Key 'DepthInverted'
+        $dm = Get-MgpuIniValue -Path $mgpuIni -Key 'Depth'
+        Report -Status 'Na' -Text ('mgpu.ini: Depth=' + $(if ($null -ne $dm) { $dm } else { '(absent: 0)' }) + ' DepthInverted=' + $(if ($null -ne $di) { $di } else { '(absent: 1)' }) + '.') `
+               -Detail 'DepthInverted must match what the feeder tells DLSS (depth_inverted / RESHADE_DEPTH_INPUT_IS_REVERSED). dlss5-feed.log warns when the two disagree.'
+    }
+    else {
+        Report -Status 'Fail' -Text 'mgpu.ini is missing beside the MGPU Bridge add-on.' `
+               -Detail 'Without it MVec and MvecFromEval default to 0, so it takes no motion vectors; its window shows ERROR 205.' `
+               -Action ('Copy mgpu.ini from MGPU Bridge''s release zip into ' + $consumerDir)
+    }
+    $rs2 = Find-FileIn $consumerDir 'ReShade2.ini'
+    $gp1 = Find-FileIn $consumerDir 'gpu1.ini'
+    $rs2Preset = $null
+    if ($rs2) { $rs2Preset = Get-IniValue -Path $rs2 -Section 'GENERAL' -Key 'PresetPath' }
+    if ($rs2 -and $gp1 -and $rs2Preset -and $rs2Preset -imatch 'gpu1\.ini') {
+        Report -Status 'Ok' -Text 'ReShade2.ini (PresetPath -> gpu1.ini) and gpu1.ini present.' `
+               -Detail 'MGPU''s window is a second swapchain; ReShade builds a second runtime for it and configures it from ReShade2.ini.'
+    }
+    else {
+        Report -Status 'Warn' -Text 'ReShade2.ini / gpu1.ini are missing, or ReShade2.ini does not point PresetPath at gpu1.ini.' `
+               -Detail 'Without them the runtime ReShade builds for MGPU''s own window gets ReShade''s defaults, and whatever it enables is drawn over the neural output.' `
+               -Action ('Copy both from MGPU Bridge''s release zip into ' + $consumerDir)
+    }
+    $tap = Find-FileIn $consumerDir 'mgpu_depth_tap.fx'
+    if (-not $tap) { $tap = Find-FileUnder (Join-Safe $consumerDir 'reshade-shaders') 'mgpu_depth_tap.fx' }
+    if ($tap) {
+        Report -Status 'Ok' -Text 'mgpu_depth_tap.fx present.' -Detail $tap
+    }
+    else {
+        Report -Status 'Fail' -Text ('mgpu_depth_tap.fx was not found in ' + $consumerWhere + ' or its reshade-shaders\.') `
+               -Detail 'It is MGPU''s depth source AND what makes ReShade run an effects pass at all on that runtime; without a compiled technique ReShade never raises the event MGPU captures colour on (its ERROR 204). For a 32-bit game it goes in host64\.' `
+               -Action ('Copy reshade-shaders\Shaders\mgpu_depth_tap.fx from MGPU Bridge''s release zip into ' + $consumerDir)
+    }
+}
 elseif ($dfcAddon) {
     $dfcVer = Get-BinaryMarker -Path $dfcAddon -Pattern 'Deep Fried Chicken (\d[\w.\-+]*)'
     if ($dfcVer) { $t = 'Deep Fried Chicken ' + $dfcVer + ' (recommended default).' }
@@ -1325,7 +1415,7 @@ elseif ($renoAddon) {
 }
 else {
     Report -Status 'Fail' -Text 'No neural consumer found.' `
-           -Detail ('Expected deep-fried-chicken.addon64 (recommended), renodx-dlss5.addon64, or the OptiScaler DLSS-NR set (winmm.dll + OptiScaler.ini + nvngx.dll_dlssnr.dll) in ' + $consumerDir + '. The feeder publishes a synthetic DLSS contract; without a consumer, nothing acts on it.') `
+           -Detail ('Expected deep-fried-chicken.addon64 (recommended), renodx-dlss5.addon64, the OptiScaler DLSS-NR set (winmm.dll + OptiScaler.ini + nvngx.dll_dlssnr.dll), or -- with a second RTX GPU, ALPHA -- MGPU Bridge, in ' + $consumerDir + '. The feeder publishes a synthetic DLSS contract; without a consumer, nothing acts on it.') `
            -Action ('Copy deep-fried-chicken.addon64 (+ deep-fried-chicken-nvngx.dll and deep-fried-chicken.cfg) into ' + $consumerDir)
 }
 
@@ -1360,8 +1450,38 @@ if ($dx11Bridge) {
 
 Write-Section 'NVIDIA NGX runtimes'
 
+# MGPU Bridge is the one consumer that wants the neural model somewhere else: in a subfolder
+# beside its add-on (mgpu\), and NOT beside the exe -- it has to hold the only copy so that NGX
+# binds the model to the second GPU, and it reports INSTALL PROBLEM otherwise.
+$mgpuSole = [bool]$mgpuAddon -and ($consumers.Count -eq 1)
 foreach ($n in @('nvngx_dlssnr.dll', 'nvngx_dlss.dll')) {
     $p = Find-FileIn $consumerDir $n
+    if ($mgpuSole -and $n -eq 'nvngx_dlssnr.dll') {
+        $beside = $p
+        $p = Find-FileIn (Join-Safe $consumerDir 'mgpu') $n
+        if (-not $p) {
+            # MGPU also looks in every other immediate subfolder (a typo'd "mpgu" cost its author an evening).
+            try {
+                foreach ($sub in @(Get-ChildItem -LiteralPath $consumerDir -Directory -ErrorAction SilentlyContinue)) {
+                    $p = Find-FileIn $sub.FullName $n
+                    if ($p) { break }
+                }
+            }
+            catch { }
+        }
+        if ($beside) {
+            Report -Status 'Fail' -Text ('nvngx_dlssnr.dll is beside the exe in ' + $consumerWhere + ' -- MGPU Bridge''s INSTALL PROBLEM.') `
+                   -Detail 'MGPU must hold the only copy, in mgpu\ beside its add-on, so that NGX binds the neural model to the SECOND GPU. (Every other consumer wants the opposite, which is one more reason to run exactly one.)' `
+                   -Action ('Move ' + $beside + ' into ' + (Join-Safe $consumerDir 'mgpu'))
+        }
+        if (-not $p -and $beside) { continue }   # the move above is the whole fix
+        if (-not $p) {
+            Report -Status 'Fail' -Text 'nvngx_dlssnr.dll is not in mgpu\ beside the MGPU Bridge add-on.' `
+                   -Detail 'This is the neural-rendering model itself; MGPU loads a private copy from that subfolder.' `
+                   -Action ('Copy nvngx_dlssnr.dll into ' + (Join-Safe $consumerDir 'mgpu'))
+            continue
+        }
+    }
     if ($p) {
         $v = Get-FileVersionSafe $p
         if ($v) { $t = $n + ': ' + $v } else { $t = $n + ': present (no version info)' }
@@ -1369,6 +1489,7 @@ foreach ($n in @('nvngx_dlssnr.dll', 'nvngx_dlss.dll')) {
         # the version alone cannot tell them apart -- and that is exactly the distinction
         # issue #47 turns on. The product/description strings do differ, so print them.
         $d = ('in ' + $consumerWhere)
+        if ($mgpuSole -and $n -eq 'nvngx_dlssnr.dll') { $d = 'in ' + (Split-Path -Leaf (Split-Path -Parent $p)) + [char]92 + ' beside the MGPU Bridge add-on (where MGPU wants it)' }
         $pn = Get-ProductNameSafe $p
         if ($pn) { $d = $d + "`n" + $pn }
         # Two more fields, and neither is asserted to be decisive. This used to call

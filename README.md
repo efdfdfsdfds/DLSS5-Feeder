@@ -285,6 +285,7 @@ your antivirus.
   - [Deep Fried Chicken: first run](#deep-fried-chicken-first-run)
   - [Alternative: the RenoDX add-on](#alternative-the-renodx-add-on)
   - [Alternative: OptiScaler DLSS-NR](#alternative-optiscaler-dlss-nr)
+  - [Alternative: MGPU Bridge (second GPU) — ALPHA](#alternative-mgpu-bridge-second-gpu--alpha)
 - [Install for a 32-bit game](#install-for-a-32-bit-game-beta)
 - [Install for a DirectX 10 game](#install-for-a-directx-10-game-beta)
 - [Install for a DirectX 9 game](#install-for-a-directx-9-game-beta)
@@ -588,6 +589,68 @@ says the DRIVER answered the probe, OptiScaler is present but its redirect did n
 If the model is `NOT loaded`, `OptiScaler.log` beside the DLL names the missing piece. A stock
 OptiScaler build is reported as such: it upscales and never runs a neural pass.
 `Verify-DLSS5Feeder.ps1` checks the whole layout and reads both logs.
+
+### Alternative: MGPU Bridge (second GPU) — ALPHA
+
+> **ALPHA, and untested end to end.** MGPU Bridge refuses to start without a second
+> neural-capable (RTX) GPU, and nobody on this project has one. What has been checked is its
+> source, and everything that can be observed on a single-GPU machine: it loads, its calibrator
+> sees this feeder's feature create and reads its motion-vector table on every evaluate, and the
+> 32-bit helper presents one game frame per evaluate with no D3D12 debug-layer errors. Whether
+> the picture on the second GPU is right is for someone with two RTX cards to report.
+
+**[MGPU Bridge](https://github.com/maohgad-web/Neural-coprocessor/releases)** (maohgad-web) is a
+D3D12-only ReShade add-on that runs the DLSS 5 neural model on a **second GPU** and shows the
+result in **its own window**, on the second card's display. It was built for games that already
+have DLSS: it copies the game's motion vectors out of the game's own DLSS call. In a game with no
+DLSS it has no vectors at all — and the call it listens for is exactly the one this feeder makes
+every frame, with validated optical-flow vectors. So the two pair up with no protocol between
+them. Nothing neural appears in the game's own picture: the game shows this feeder's plain DLAA,
+and MGPU's window shows the neural result.
+
+What it needs is the **opposite** of the other consumers in one respect, so it cannot share a
+folder with them:
+
+- Unpack MGPU Bridge's release zip into the folder where the DLSS work happens: next to the game
+  `.exe` for a 64-bit **Direct3D 12** game, into `host64\` for a 32-bit game (any API — the helper
+  is a D3D12 process, which is what makes this possible at all). That is
+  `nvngx.dll_mgpu_bridge.addon64` (do not rename it), `mgpu.ini`, `ReShade2.ini`, `gpu1.ini`, and
+  `reshade-shaders\Shaders\mgpu_depth_tap.fx`.
+- `nvngx_dlssnr.dll` goes in a folder called **`mgpu`** beside the add-on, and must **not** be
+  beside the exe (MGPU reports `INSTALL PROBLEM`). Every other consumer needs it beside the exe.
+  `nvngx_dlss.dll` stays beside the exe as always.
+- Remove every other consumer from that folder (Deep Fried Chicken's three files, any
+  `renodx-dlss5*.addon64`, OptiScaler). Another consumer would run the neural model on the first
+  GPU, into the very frame MGPU then copies and runs it on again.
+- Leave `mgpu.ini` at its shipped `Calib=2`, `MVec=3`, `MvecFromEval=2`. With any of them at 0 it
+  takes no vectors from this feeder. `DepthInverted` must match what the feeder tells DLSS; the
+  log warns when it does not. The feeder never writes to MGPU's files.
+- For a 32-bit game, `mgpu_depth_tap.fx` has to be where the **helper's** ReShade finds it:
+  `host64\` itself, or `host64\reshade-shaders\Shaders\` (the helper adds that path to its own
+  `ReShade.ini`).
+
+The installer does not download MGPU Bridge. If it finds it already in place it treats it as the
+consumer: no other consumer is installed, `nvngx_dlssnr.dll` goes into `mgpu\`, and for a 32-bit
+game a set unpacked beside the game `.exe` is moved into `host64\`.
+
+**64-bit Direct3D 12 game.** The feeder does what it does with no consumer — DLAA, written back —
+and skips its warm-up re-create, because MGPU can latch only four feature handles per process and
+never lets one go (after a fifth create, for instance several resolution changes, its vectors
+freeze until the game restarts; the feeder counts and says so). In `ReShade.log`,
+`[MGPU][R134] GAME CreateFeature: id=1` is MGPU seeing the feeder's create, and `eval-copies` on
+its `[MGPU][R101]` line is the count of vector copies it took from the feeder.
+
+**64-bit Direct3D 11, Vulkan or OpenGL game.** Not supported: MGPU never arms outside D3D12. The
+feeder says so and carries on as plain DLAA.
+
+**32-bit game.** With MGPU alone in `host64\` the helper changes role. Its window stops being a
+settings panel and becomes the game's frame: the swapchain takes the game's resolution and
+format, each evaluate's output is copied into it and presented exactly once, the game's depth is
+bound as ReShade's `DEPTH` there (the helper registers itself with its own ReShade as an add-on to
+do that), and the vector texture is put in the state MGPU's copy expects. The in-game panel cast
+is off in this mode. `host64\dlss5-feed-host.log` says `frame mode: swapchain is now WxH …` and,
+every 1800 frames, a `frame mode (running)` line: `finish_effects` there must not be 0, or
+`mgpu_depth_tap.fx` is not being compiled by the helper's ReShade and MGPU captures nothing.
 
 ## Install for a 32-bit game (beta)
 
@@ -1429,6 +1492,12 @@ swapchain, so nothing in the table under [Status](#status) can be verified there
 
 ## Limitations and roadmap
 
+* **MGPU Bridge support is ALPHA and unverified end to end.** It needs two RTX GPUs, which this
+  project does not have. 64-bit support is Direct3D 12 only (MGPU itself is); a 64-bit D3D11,
+  Vulkan or OpenGL game would need an in-process mirror swapchain, which is not written. MGPU
+  latches at most four feature handles per process, so repeated resolution changes freeze its
+  motion vectors until a restart. See
+  [Alternative: MGPU Bridge](#alternative-mgpu-bridge-second-gpu--alpha).
 * **DLAA contract, optional reduced work extent on D3D11** — render resolution still
   equals DLAA output resolution, but the private work extent can be 50–100% of the native
   backbuffer and is spatially expanded afterward (bilinear, or FSR 1 with `work_upscale=1`).
