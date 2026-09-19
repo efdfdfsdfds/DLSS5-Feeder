@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <share.h>
 #include <vector>
 #include <string>
 
@@ -981,6 +982,108 @@ static void CloseListGuarded()
     __try { h.list->Close(); } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
+// Device Removed Extended Data, opt-in: [DLSS5Host] Dred=1 in this folder's ReShade.ini.
+// A hang on this device is this file's work, the neural consumer's inline pass recorded
+// into the same list, or NGX's own -- and "DEVICE_HUNG" alone cannot say which (#119: three
+// consumer versions, the same removal about five seconds after feature 18 first evaluated,
+// and nothing in the log to tell them apart). Off by default because arming DRED before
+// the create is the one thing the add-on does that this helper never did, and on some
+// runtimes it is what makes D3D12CreateDevice fail (#47).
+static bool g_dred_armed = false;
+
+typedef HRESULT (WINAPI *PFN_D3D12GetDebugInterface_)(REFIID, void **);
+
+static void HostEnableDred(const char *ini)
+{
+    if (GetPrivateProfileIntA("DLSS5Host", "Dred", 0, ini) == 0) return;
+    HMODULE d3d12 = GetModuleHandleW(L"d3d12.dll");
+    if (d3d12 == nullptr) d3d12 = LoadLibraryW(L"d3d12.dll");
+    if (d3d12 == nullptr) return;
+    auto get_debug = reinterpret_cast<PFN_D3D12GetDebugInterface_>(GetProcAddress(d3d12, "D3D12GetDebugInterface"));
+    if (get_debug == nullptr) { Log("[host] DRED: no D3D12GetDebugInterface"); return; }
+    ID3D12DeviceRemovedExtendedDataSettings *dred = nullptr;
+    const HRESULT hr = get_debug(__uuidof(ID3D12DeviceRemovedExtendedDataSettings), reinterpret_cast<void **>(&dred));
+    if (FAILED(hr) || dred == nullptr) { Log("[host] DRED: settings unavailable 0x%08X", hr); return; }
+    dred->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+    dred->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+    dred->Release();
+    g_dred_armed = true;
+    Log("[host] DRED: auto-breadcrumbs and page-fault reporting enabled ([DLSS5Host] Dred=1). If "
+        "D3D12CreateDevice fails below, set Dred=0 again");
+}
+
+static void HostDumpDred()
+{
+    if (!g_dred_armed || h.dev == nullptr) return;
+    ID3D12DeviceRemovedExtendedData *dred = nullptr;
+    HRESULT hr = h.dev->QueryInterface(__uuidof(ID3D12DeviceRemovedExtendedData), reinterpret_cast<void **>(&dred));
+    if (FAILED(hr) || dred == nullptr) { Log("[host] DRED: QueryInterface failed 0x%08X", hr); return; }
+
+    Log("[host] ===== DRED: 'feed' is the queue the evaluate (and a neural consumer's inline pass) runs on; "
+        "'pump' only paints and presents this window =====");
+    D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT bc = {};
+    hr = dred->GetAutoBreadcrumbsOutput(&bc);
+    if (SUCCEEDED(hr))
+    {
+        int node_index = 0;
+        for (const D3D12_AUTO_BREADCRUMB_NODE *node = bc.pHeadAutoBreadcrumbNode;
+             node != nullptr && node_index < 8; node = node->pNext, ++node_index)
+        {
+            const UINT32 last = node->pLastBreadcrumbValue != nullptr ? *node->pLastBreadcrumbValue : 0;
+            // A list that ran to its end is not the one that hung; say so rather than print it.
+            const bool finished = last >= node->BreadcrumbCount;
+            Log("[host] DRED node %d: queue='%ls' list='%ls' executed %u of %u ops%s", node_index,
+                node->pCommandQueueDebugNameW ? node->pCommandQueueDebugNameW : L"(unnamed)",
+                node->pCommandListDebugNameW ? node->pCommandListDebugNameW : L"(unnamed -- not this helper's: NGX's or the consumer's)",
+                last, node->BreadcrumbCount, finished ? " (finished)" : "");
+            if (finished || node->pCommandHistory == nullptr) continue;
+            // The op at 'last' is the one that had not finished. The common ones by name, the
+            // rest by their D3D12_AUTO_BREADCRUMB_OP number (d3d12.h).
+            for (UINT32 i = last > 12 ? last - 12 : 0; i < node->BreadcrumbCount && i <= last; ++i)
+            {
+                const D3D12_AUTO_BREADCRUMB_OP op = node->pCommandHistory[i];
+                const char *name = op == D3D12_AUTO_BREADCRUMB_OP_DISPATCH          ? "Dispatch"
+                                 : op == D3D12_AUTO_BREADCRUMB_OP_EXECUTEINDIRECT   ? "ExecuteIndirect"
+                                 : op == D3D12_AUTO_BREADCRUMB_OP_COPYRESOURCE      ? "CopyResource"
+                                 : op == D3D12_AUTO_BREADCRUMB_OP_COPYTEXTUREREGION ? "CopyTextureRegion"
+                                 : op == D3D12_AUTO_BREADCRUMB_OP_COPYBUFFERREGION  ? "CopyBufferRegion"
+                                 : op == D3D12_AUTO_BREADCRUMB_OP_RESOURCEBARRIER   ? "ResourceBarrier"
+                                 : op == D3D12_AUTO_BREADCRUMB_OP_RESOLVEQUERYDATA  ? "ResolveQueryData"
+                                 : op == D3D12_AUTO_BREADCRUMB_OP_DRAWINSTANCED     ? "DrawInstanced"
+                                 : op == D3D12_AUTO_BREADCRUMB_OP_PRESENT           ? "Present"
+                                                                                    : "op";
+                Log("[host] DRED   op[%u] %s (%d)%s", i, name, static_cast<int>(op),
+                    i == last ? " <== had not finished" : "");
+            }
+        }
+        if (bc.pHeadAutoBreadcrumbNode == nullptr) Log("[host] DRED: no breadcrumb nodes");
+    }
+    else Log("[host] DRED: GetAutoBreadcrumbsOutput failed 0x%08X", hr);
+
+    D3D12_DRED_PAGE_FAULT_OUTPUT pf = {};
+    hr = dred->GetPageFaultAllocationOutput(&pf);
+    if (SUCCEEDED(hr))
+    {
+        if (pf.PageFaultVA == 0)
+            Log("[host] DRED: no page fault recorded (GPU work that never finished, not an invalid memory access)");
+        else
+        {
+            Log("[host] DRED page fault VA: 0x%llX", static_cast<unsigned long long>(pf.PageFaultVA));
+            int n = 0;
+            for (const D3D12_DRED_ALLOCATION_NODE *a = pf.pHeadExistingAllocationNode; a != nullptr && n < 8; a = a->pNext, ++n)
+                Log("[host] DRED   existing alloc: type %d '%ls'", static_cast<int>(a->AllocationType),
+                    a->ObjectNameW ? a->ObjectNameW : L"(unnamed)");
+            n = 0;
+            for (const D3D12_DRED_ALLOCATION_NODE *a = pf.pHeadRecentFreedAllocationNode; a != nullptr && n < 8; a = a->pNext, ++n)
+                Log("[host] DRED   RECENTLY FREED: type %d '%ls'", static_cast<int>(a->AllocationType),
+                    a->ObjectNameW ? a->ObjectNameW : L"(unnamed)");
+        }
+    }
+    else Log("[host] DRED: GetPageFaultAllocationOutput failed 0x%08X", hr);
+    dred->Release();
+    Log("[host] ===== DRED end =====");
+}
+
 // A removed D3D12 device never comes back: every later OpenSharedHandle fails with
 // DXGI_ERROR_DEVICE_REMOVED, every create stalls, and the window (a swapchain on that
 // device) stops answering. The add-on already respawns a host that exits, so the right
@@ -993,8 +1096,17 @@ static bool DeviceRemoved(const char *where)
     const HRESULT reason = h.dev->GetDeviceRemovedReason();
     if (SUCCEEDED(reason)) return false;
     if (!g_device_removed)
+    {
         Log("[host] the D3D12 device was removed (0x%08X%s) during %s; exiting so the game can respawn a fresh host",
             reason, reason == DXGI_ERROR_DEVICE_HUNG ? " DEVICE_HUNG" : reason == DXGI_ERROR_DEVICE_RESET ? " DEVICE_RESET" : "", where);
+        if (reason == DXGI_ERROR_DEVICE_HUNG)
+            Log("[host] DEVICE_HUNG is GPU work that never finished. If this process's ReShade.log shows the neural "
+                "consumer evaluating feature 18 shortly before, turn neural rendering off in the consumer (or take "
+                "the consumer's .addon64 out of host64\\) and run again: a feed that survives that way puts the hang "
+                "in the consumer's pass or the NVIDIA runtime under it, not in this helper%s",
+                g_dred_armed ? "" : ". [DLSS5Host] Dred=1 in host64\\ReShade.ini makes the next removal name the queue and the op");
+        HostDumpDred();
+    }
     g_device_removed = true;
     return true;
 }
@@ -1052,8 +1164,9 @@ static void CaptureReShadeLogStart()
     char path[MAX_PATH] = {};
     GetModuleFileNameA(nullptr, path, MAX_PATH);
     if (char *slash = strrchr(path, '\\')) strcpy_s(slash + 1, MAX_PATH - (slash + 1 - path), "ReShade.log");
-    FILE *f = nullptr;
-    if (fopen_s(&f, path, "rb") == 0 && f != nullptr)
+    // _fsopen with _SH_DENYNO, not fopen_s: see LogNeuralConsumerOutcome.
+    FILE *f = _fsopen(path, "rb", _SH_DENYNO);
+    if (f != nullptr)
     {
         _fseeki64(f, 0, SEEK_END);
         g_reshade_log_start = _ftelli64(f);
@@ -1070,10 +1183,17 @@ static void LogNeuralConsumerOutcome()
     GetModuleFileNameA(nullptr, path, MAX_PATH);
     if (char *slash = strrchr(path, '\\')) strcpy_s(slash + 1, MAX_PATH - (slash + 1 - path), "ReShade.log");
 
-    FILE *f = nullptr;
-    if (fopen_s(&f, path, "rb") != 0 || f == nullptr)
+    // fopen_s opens with _SH_SECURE, which for a read asks that nobody else WRITE the file --
+    // and ReShade holds its log open for writing for the life of the process, so that open
+    // failed with a sharing violation every time ReShade was really there. Every real install
+    // therefore got "consumer did not intercept (ReShade.log is unavailable)" 300 frames in,
+    // over a consumer that had created and evaluated feature 18 (#119). And "could not read
+    // the log" is not "did not intercept": say only what is known.
+    FILE *f = _fsopen(path, "rb", _SH_DENYNO);
+    if (f == nullptr)
     {
-        Log("[host] neural consumer outcome: consumer did not intercept (ReShade.log is unavailable)");
+        Log("[host] neural consumer outcome: unknown (this process's ReShade.log could not be opened, error %d; "
+            "read host64\\ReShade.log for feature 18 yourself)", errno);
         return;
     }
     _fseeki64(f, 0, SEEK_END);
@@ -1707,6 +1827,16 @@ static bool PumpPresent(bool force = false)
             static HRESULT            last_hr = S_OK;
             const bool                fresh   = (hr != last_hr);
             last_hr = hr;
+            // DEVICE_REMOVED / DEVICE_HUNG / DEVICE_RESET are not a window problem. The feed's
+            // queue is on the same device, so it is gone too -- and nothing else noticed: NGX
+            // keeps answering Success for an evaluate recorded on a dead device, and a removed
+            // device completes every fence, so the evaluate path never reached DeviceRemoved().
+            // #119's helper sat here for the rest of the session, logged "the feed is
+            // unaffected" 1800 presents at a time, and handed the game frames nothing had
+            // written. Name it and let the serve loop leave; the add-on then says why it stopped.
+            const bool gone = hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_HUNG ||
+                              hr == DXGI_ERROR_DEVICE_RESET;
+            if (gone && DeviceRemoved("a present")) return false;
             if (++hard == 1 || fresh || (hard % 1800) == 0)
                 Log("[host] Present failed 0x%08X (%llu so far). This window holds its last picture until "
                     "one succeeds; the feed runs on a separate queue and is unaffected.",
@@ -1886,6 +2016,11 @@ static bool InitDisguise()
     if (h.hwnd == nullptr) { Log("[host] window creation failed"); return false; }
     if (g_show_window) ShowWindow(h.hwnd, SW_SHOWNOACTIVATE);   // never steal the game's focus
 
+    {
+        char ini[MAX_PATH];
+        HostIniPath(ini, sizeof(ini));
+        HostEnableDred(ini);   // must precede the create; does nothing unless [DLSS5Host] Dred=1
+    }
     HRESULT hr = create_device(nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device),
                                reinterpret_cast<void **>(&h.dev));
     if (FAILED(hr))
@@ -1906,6 +2041,8 @@ static bool InitDisguise()
     h.dev->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue), reinterpret_cast<void **>(&h.pump_queue));
     h.dev->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue), reinterpret_cast<void **>(&h.queue));
     if (h.pump_queue == nullptr || h.queue == nullptr) { Log("[host] queue creation failed"); return false; }
+    h.pump_queue->SetName(L"dlss5-feed-host pump queue");
+    h.queue->SetName(L"dlss5-feed-host feed queue");
 
     IDXGIFactory2 *factory = nullptr;
     hr = create_factory(__uuidof(IDXGIFactory2), reinterpret_cast<void **>(&factory));
@@ -2817,7 +2954,13 @@ static int Serve(DWORD game_pid)
             // Idle: the game has not sent the next frame yet, so it is not waiting on us.
             // The one moment a Present costs it nothing -- pay off anything the
             // per-evaluate call could not present (issue #15).
-            if (r == WAIT_OBJECT_0 + 1 || r == WAIT_TIMEOUT) { PumpRetireOwedPresents(); PumpPresent(); continue; }
+            if (r == WAIT_OBJECT_0 + 1 || r == WAIT_TIMEOUT)
+            {
+                PumpRetireOwedPresents();
+                PumpPresent();
+                if (g_device_removed) break;   // PumpPresent saw the device go (#119)
+                continue;
+            }
             if (r != WAIT_OBJECT_0) break;
             DWORD got = 0;
             if (!GetOverlappedResult(pipe, &ov_tag, &got, FALSE) || got != 1) { pending = false; break; }
@@ -2825,7 +2968,7 @@ static int Serve(DWORD game_pid)
             tag_read = true;
             break;
         }
-        if (!tag_read) { Log("[host] pipe closed by the game"); break; }
+        if (!tag_read) { if (!g_device_removed) Log("[host] pipe closed by the game"); break; }
 
         if (tag == 'B')
         {
@@ -3160,7 +3303,13 @@ static int Serve(DWORD game_pid)
             // arriving at game rate the tag wait never goes idle -- so a bare `continue`
             // left the window unpumped for as long as the feature was missing, and
             // Windows ghosts it as "Not Responding" within seconds while the game runs on.
-            if (h.feature == nullptr && !transport_only) { h.fence_out->Signal(fm.n); PumpPresent(); continue; }
+            if (h.feature == nullptr && !transport_only)
+            {
+                h.fence_out->Signal(fm.n);
+                PumpPresent();
+                if (g_device_removed) break;
+                continue;
+            }
 
             // Order the evaluate behind the game's input copies on the GPU timeline and
             // move on. This used to block the CPU on the same value first, which
@@ -3311,6 +3460,7 @@ static int Serve(DWORD game_pid)
             PumpRetireOwedPresents(1);
             g_pace_presents += 1 + (owed_before - g_present_owed);
             PumpPresent(true);   // per evaluate, deliberately -- see PumpPresent
+            if (g_device_removed) break;   // the present is where a hung device shows first (#119)
         }
         else
         {

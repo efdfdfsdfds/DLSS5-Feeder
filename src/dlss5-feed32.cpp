@@ -38,6 +38,7 @@
 #include <d3dcompiler.h>
 #include <dwmapi.h>   // the cast: a DWM live thumbnail of the host window, drawn in the game window
 #include <cstdio>
+#include <share.h>
 #include <cstdarg>
 #include <cstdint>
 #include <cstring>
@@ -320,6 +321,11 @@ struct Cfg
                            // games froze the instant the helper's shown window appeared under them
                            // (#109 Injustice, #99 Transformers, #77 Dragon Age: Origins), and the
                            // compositor cannot draw the cast over exclusive fullscreen anyway.
+                           // 3 = 0 without that: behind the game, and NEVER turned into --hide. For a
+                           // wrapper whose swapchain reports fullscreen over what is really a borderless
+                           // window -- dgVoodoo calls SetFullscreenState(TRUE) whatever its own
+                           // FullScreenMode says, so at 0 the panel was lost on every run and no dgVoodoo
+                           // setting could bring it back (#118).
     int   host_gpu_priority; // 1 = pass --gpu-priority, asking the GPU scheduler to favour the
                            // helper process. Off by default: it can starve the game it is meant to
                            // help, and it only matters where the helper is being preempted (#83,
@@ -545,7 +551,7 @@ static bool CfgReload()   // true when a build-affecting value changed
         else if (_stricmp(key, "flags")          == 0) next.flags          = iv;
         else if (_stricmp(key, "reset_every")    == 0) next.reset_every    = iv;
         else if (_stricmp(key, "log_frames")     == 0) next.log_frames     = iv;
-        else if (_stricmp(key, "host_window")    == 0) next.host_window    = iv;
+        else if (_stricmp(key, "host_window")    == 0) next.host_window    = (iv >= 0 && iv <= 3) ? iv : 0;
         else if (_stricmp(key, "host_gpu_priority") == 0) next.host_gpu_priority = iv;
         else if (_stricmp(key, "work_resolution")== 0) next.work_resolution = iv;
         else if (_stricmp(key, "work_upscale")   == 0) next.work_upscale   = iv;
@@ -617,8 +623,10 @@ static bool ProviderCompileError(const char *file, char *out, size_t out_size)
     char path[MAX_PATH];
     GetModuleFileNameA(g_self, path, MAX_PATH);
     if (char *s = strrchr(path, '\\')) strcpy_s(s + 1, MAX_PATH - (s + 1 - path), "ReShade.log");
-    FILE *f = nullptr;
-    if (fopen_s(&f, path, "rb") != 0 || f == nullptr) return false;
+    // _fsopen with _SH_DENYNO, not fopen_s: fopen_s asks that nobody else write the file, and
+    // ReShade holds its log open for writing, so that open failed every time (#119).
+    FILE *f = _fsopen(path, "rb", _SH_DENYNO);
+    if (f == nullptr) return false;
     fseek(f, 0, SEEK_END);
     const long size = ftell(f);
     const long take = size < 512 * 1024 ? size : 512 * 1024;
@@ -1541,7 +1549,8 @@ static bool CastLayout()
         strcpy_s(g_cast_status, g_cfg.host_window == 2
             ? "the host runs without a window (host_window=2); nothing to cast"
             : "the host runs without a window because the game was exclusive fullscreen when it started; "
-              "switch the game to borderless and restart it for the panel");
+              "switch the game to borderless and restart it for the panel (or host_window=3 if a wrapper "
+              "such as dgVoodoo only reports fullscreen)");
         return false;
     }
 
@@ -1673,7 +1682,7 @@ static bool CastLayout()
         g_cast_scale = s;
         Log("[feed32] cast: %ldx%ld of the host window shown at %dx%d (scale %.2f)", src.cx, src.cy, dw, dh, s);
     }
-    if (g_cast_fullscreen)
+    if (g_cast_fullscreen && g_cfg.host_window != 3)
         strcpy_s(g_cast_status, "shown, but the game is exclusive fullscreen: the compositor cannot draw over it -- use borderless");
     else
         sprintf_s(g_cast_status, "shown at %dx%d%s", dw, dh, g_cast_hover ? " (cursor over it)" : "");
@@ -1857,8 +1866,25 @@ static void CastTick(reshade::api::effect_runtime *rt)
     }
     else if (g_cfg.cast_key > 0 && rt->is_key_pressed(static_cast<uint32_t>(g_cfg.cast_key)))
     {
-        g_cast_wanted = !g_cast_wanted;
-        Log("[feed32] cast: %s (key)", g_cast_wanted ? "shown" : "hidden");
+        // With the host started --hide there is no window to cast. The key used to toggle
+        // anyway and log "cast: shown (key)" over nothing at all, which reads as a panel that
+        // should have appeared (#118). Say why, once, and leave the state alone.
+        if (g_host_hidden && HostAlive())
+        {
+            static bool said = false;
+            if (!said)
+            {
+                said = true;
+                Log("[feed32] cast: key pressed, but the host runs without a window this session (%s); nothing to show",
+                    g_cfg.host_window == 2 ? "host_window=2"
+                                           : "the swapchain was exclusive fullscreen at host start -- host_window=3 overrides that");
+            }
+        }
+        else
+        {
+            g_cast_wanted = !g_cast_wanted;
+            Log("[feed32] cast: %s (key)", g_cast_wanted ? "shown" : "hidden");
+        }
     }
 
     if (!g_cast_wanted)
@@ -2275,14 +2301,23 @@ static bool HostWorkerConnect(HANDLE ev)
     // fullscreen swapchain, and never came back: the game side of each log ends at "host
     // spawned" while the host side shows a healthy handshake. The cast could not have drawn
     // over exclusive fullscreen anyway (CastLayout says so), so the window buys nothing there.
+    //
+    // host_window=3 is the way out of that for a swapchain that only CLAIMS fullscreen: a
+    // wrapper presenting into a borderless window (dgVoodoo, #118). The add-on cannot tell
+    // the two apart from the fullscreen state alone, so the user says so.
     const bool hide = g_cfg.host_window == 2 || (g_cfg.host_window == 0 && g_cast_fullscreen);
     g_host_hidden = hide;
     if (hide)
         Log("[feed32] starting the host without a window (%s): the in-game panel is unavailable this session%s",
             g_cfg.host_window == 2 ? "host_window=2" : "the game's swapchain is exclusive fullscreen",
-            g_cfg.host_window == 2 ? "" : " -- switch the game to borderless/windowed to get it back (#109)");
+            g_cfg.host_window == 2 ? "" : " -- switch the game to borderless/windowed to get it back (#109). If it "
+                                          "already IS a borderless window behind a wrapper such as dgVoodoo, which "
+                                          "reports fullscreen regardless, set host_window=3 in dlss5-feed.cfg (#118)");
+    else if (g_cfg.host_window == 3 && g_cast_fullscreen)
+        Log("[feed32] host_window=3: the game's swapchain reports exclusive fullscreen and the host gets its window "
+            "anyway. If the game stops presenting right after this line, that fullscreen is real: go back to host_window=0");
     sprintf_s(cmd, "\"%s\" %lu%s%s", exe, GetCurrentProcessId(),
-              hide ? " --hide" : g_cfg.host_window ? "" : " --behind",
+              hide ? " --hide" : g_cfg.host_window == 1 ? "" : " --behind",
               g_cfg.host_gpu_priority ? " --gpu-priority" : "");
 
     STARTUPINFOA si = { sizeof(si) };
@@ -5556,6 +5591,19 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
         else if (g.backbuffer_width != 0)
             ImGui::TextDisabled("Active: %ux%u (%d%%) -> %ux%u", g.width, g.height,
                                 g_cfg.work_resolution, g.backbuffer_width, g.backbuffer_height);
+        // The feeder does not run the neural pass; it can only shrink the WHOLE frame it hands
+        // over, and what comes back is stretched over the backbuffer. Shrinking the model's work
+        // alone, with the frame left at full size, is something only the consumer can do.
+        if (g_work_resolution_ui < 100 || g_cfg.work_resolution < 100)
+        {
+            ImGui::PushTextWrapPos(ImGui::GetFontSize() * 30.0f);
+            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
+                               "Below 100% the whole image is rendered smaller and stretched back, so it looks "
+                               "blurry. For a sharp image, leave this at 100% and feed a DLSS 5 neural rendering "
+                               "mod that can lower the resolution of the neural pass alone, such as OptiScaler "
+                               "DLSS-NR (WorkingScale under [DlssNr] in OptiScaler.ini).");
+            ImGui::PopTextWrapPos();
+        }
 
         const bool fsr_available = g.blit_vs == nullptr || g.fsr_ok;   // unknown until the shaders compile
         if (!fsr_available) ImGui::BeginDisabled();
@@ -5679,6 +5727,17 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
     }
     bool show_host_window = g_cfg.host_window == 1;
     if (ImGui::Checkbox("Show the DLSS 5 host window", &show_host_window)) { g_cfg.host_window = show_host_window ? 1 : 0; dirty = true; }
+    if (g_cfg.host_window == 3 || (g_cfg.host_window == 0 && g_cast_fullscreen))
+    {
+        bool keep_panel = g_cfg.host_window == 3;
+        if (ImGui::Checkbox("Keep the in-game panel although the swapchain reports fullscreen", &keep_panel))
+        { g_cfg.host_window = keep_panel ? 3 : 0; dirty = true; }
+        ImGui::SameLine(); HelpMarker("For wrappers such as dgVoodoo, which put the swapchain in the fullscreen state even "
+                                      "when they present into a borderless window. Without this the helper starts with no "
+                                      "window and there is no in-game panel (#118). Leave it off for a game that is really "
+                                      "exclusive fullscreen: three of those froze when the helper's window appeared (#109). "
+                                      "Saved as host_window=3; takes effect when the host is next started.");
+    }
     ImGui::SameLine(); HelpMarker("The helper process's own separate window, the old way in. Not needed for the "
                                   "in-game panel above. Takes effect when the host is next started. host_window=2 in "
                                   "dlss5-feed.cfg starts the helper with no window at all; that also happens by itself "

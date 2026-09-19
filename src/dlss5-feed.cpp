@@ -38,6 +38,7 @@
 #include <dxgi1_4.h>
 #include <d3dcompiler.h>
 #include <cstdio>
+#include <share.h>
 #include <cstdarg>
 #include <cstdint>
 #include <cstring>
@@ -1316,8 +1317,10 @@ static bool ProviderCompileError(const char *file, char *out, size_t out_size)
     char path[MAX_PATH];
     GetModuleFileNameA(g_self, path, MAX_PATH);
     if (char *s = strrchr(path, '\\')) strcpy_s(s + 1, MAX_PATH - (s + 1 - path), "ReShade.log");
-    FILE *f = nullptr;
-    if (fopen_s(&f, path, "rb") != 0 || f == nullptr) return false;
+    // _fsopen with _SH_DENYNO, not fopen_s: fopen_s asks that nobody else write the file, and
+    // ReShade holds its log open for writing, so that open failed every time (#119).
+    FILE *f = _fsopen(path, "rb", _SH_DENYNO);
+    if (f == nullptr) return false;
     fseek(f, 0, SEEK_END);
     const long size = ftell(f);
     const long take = size < 512 * 1024 ? size : 512 * 1024;   // the tail is where the last reload is
@@ -8523,6 +8526,19 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
         else if (g.backbuffer_width != 0)
             ImGui::TextDisabled("Active: %ux%u (%d%%) -> %ux%u", g.width, g.height,
                                 g_cfg.work_resolution, g.backbuffer_width, g.backbuffer_height);
+        // The feeder does not run the neural pass; it can only shrink the WHOLE frame it hands
+        // over, and what comes back is stretched over the backbuffer. Shrinking the model's work
+        // alone, with the frame left at full size, is something only the consumer can do.
+        if (g_work_resolution_ui < 100 || g_cfg.work_resolution < 100)
+        {
+            ImGui::PushTextWrapPos(ImGui::GetFontSize() * 30.0f);
+            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
+                               "Below 100% the whole image is rendered smaller and stretched back, so it looks "
+                               "blurry. For a sharp image, leave this at 100% and feed a DLSS 5 neural rendering "
+                               "mod that can lower the resolution of the neural pass alone, such as OptiScaler "
+                               "DLSS-NR (WorkingScale under [DlssNr] in OptiScaler.ini).");
+            ImGui::PopTextWrapPos();
+        }
 
         // work_upscale=2 (DLSS reconstruction on synthetic jitter) is deliberately NOT on the
         // overlay: measured on Fable Anniversary it costs as much as 100% -- DLSS SR scales
