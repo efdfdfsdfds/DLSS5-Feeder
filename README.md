@@ -80,10 +80,18 @@ add-on rather than two, and there is nothing for this project to add.
 
 | Your game | What to use |
 | --- | --- |
-| 64-bit, DirectX 9 / 11 / 12 | **renodx-dlss** on its own — you do not need DLSS5-Feeder |
+| 64-bit, DirectX 9 / 11 / 12 | **renodx-dlss** on its own — you do not need DLSS5-Feeder (but see below) |
 | **32-bit** (any graphics API) | **DLSS5-Feeder** |
 | **Vulkan** | **DLSS5-Feeder** |
 | **DirectX 9**, and you want the best handling of motion | **DLSS5-Feeder** |
+
+**The first row presumes the game calls DLSS itself.** renodx-dlss works by hooking the DLSS calls a
+game already makes; in a game that has no DLSS of its own there is nothing for it to hook, and it sits
+at `Auto: Waiting` (or `Present: Waiting`) with every counter at zero — `application frame 0`,
+`DLAA/SR 0`, `RR 0`, `Upscaled resource ID: 0x0` — while looking perfectly healthy in the log. That is
+not a fault; it is the add-on having nothing to work with. Monster Hunter: World is a measured example
+(#120). A 64-bit DirectX 9/11/12 game with no native DLSS needs this project to manufacture the frames
+for it, the same as a 32-bit one.
 
 renodx-dlss is not on GitHub. It comes from the RenoDX Discord, `#DLSS5` channel:
 <https://discord.com/invite/renodx>
