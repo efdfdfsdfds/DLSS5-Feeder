@@ -2307,6 +2307,41 @@ static void LogAdapterIdentity(const char *who, ID3D12Device *dev)
         (unsigned long)luid.HighPart, (unsigned long)luid.LowPart, vendor, device, driver);
 }
 
+// Where a fault inside NVSDK_NGX_D3D12_Init came from: the module the exception address is
+// in, and the chain it was called through. That is the whole question whenever the same
+// files initialise NGX perfectly inside host64 and throw in the game (#47, #120), and until
+// now the log could only guess at it. Empty when nothing has faulted.
+static char g_ngx_init_fault[320] = "";
+
+static int NgxInitFilter(EXCEPTION_POINTERS *ep, DWORD *code)
+{
+    const EXCEPTION_RECORD *rec = ep != nullptr ? ep->ExceptionRecord : nullptr;
+    *code = rec != nullptr ? rec->ExceptionCode : 0;
+
+    char mod[MAX_PATH] = "";
+    FeedCrashModuleOf(rec != nullptr ? rec->ExceptionAddress : nullptr, mod, sizeof(mod));
+    char stack[192] = "";
+    if (ep != nullptr) FeedCrashStackModules(ep->ContextRecord, stack, sizeof(stack));
+    _snprintf_s(g_ngx_init_fault, sizeof(g_ngx_init_fault), _TRUNCATE, " in %s%s%s", mod,
+                stack[0] != 0 ? ", called through " : "", stack);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+// The four openers all report a faulted init the same way, and the one thing that was never
+// in the line is who faulted. 0x80000003 gets its own words because it is not a memory
+// fault: it is EXCEPTION_BREAKPOINT, an int 3 that was executed -- an assertion, or a jump
+// that landed in padding. This add-on issues none; WHOSE it is, the module above says (#120).
+static void LogNgxInitFault(DWORD code)
+{
+    Log("[feed] NVSDK_NGX_D3D12_Init raised exception 0x%08X (caught)%s -- %s; the feed stays off for this run",
+        code, g_ngx_init_fault,
+        code == 0x80000003u
+            ? "0x80000003 is EXCEPTION_BREAKPOINT: an int 3 was executed (an assertion, or a jump into padding), "
+              "not a memory fault. This add-on issues none; the module named here did. To tell a neural "
+              "consumer's NGX hook from the driver, start the game once with the consumer removed"
+            : "a module inside that call faulted during init; the chain above names it");
+}
+
 static NVSDK_NGX_Result SafeNgxInitOnce(const wchar_t *data_path, ID3D12Device *dev,
                                         const NVSDK_NGX_FeatureCommonInfo *info, DWORD *code)
 {
@@ -2319,7 +2354,7 @@ static NVSDK_NGX_Result SafeNgxInitOnce(const wchar_t *data_path, ID3D12Device *
                                                     "1.0", data_path, dev, info, NVSDK_NGX_Version_API);
         return r;
     }
-    __except (EXCEPTION_EXECUTE_HANDLER) { *code = GetExceptionCode(); return NVSDK_NGX_Result_Fail; }
+    __except (NgxInitFilter(GetExceptionInformation(), code)) { return NVSDK_NGX_Result_Fail; }
 }
 
 // Three machines report 0xBAD00001 (FeatureNotSupported) from this call while the SAME files
@@ -4806,8 +4841,7 @@ static bool InitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
         NVSDK_NGX_Result r = SafeNgxInit12(data_path, g.dev12, &ngx_code);
         if (ngx_code != 0)
         {
-            Log("[feed] NVSDK_NGX_D3D12_Init raised exception 0x%08X (caught) -- another module hooking NGX in this "
-                "process faulted during init; the feed stays off for this run", ngx_code);
+            LogNgxInitFault(ngx_code);
             goto fail;
         }
         Log("[feed] NVSDK_NGX_D3D12_Init -> 0x%08X (%s)", r, NgxResultName(r));
@@ -5022,8 +5056,7 @@ static bool InitSession12(reshade::api::effect_runtime *rt)
     DWORD ngx_code = 0;
     NVSDK_NGX_Result r = SafeNgxInit12(data_path, g.dev12, &ngx_code);
     if (ngx_code != 0)
-        Log("[feed] NVSDK_NGX_D3D12_Init raised exception 0x%08X (caught) -- another module hooking NGX in this "
-            "process faulted during init; the feed stays off for this run", ngx_code);
+        LogNgxInitFault(ngx_code);
     else
         Log("[feed] NVSDK_NGX_D3D12_Init -> 0x%08X (%s)", r, NgxResultName(r));
     if (NVSDK_NGX_FAILED(r))
@@ -5222,8 +5255,7 @@ static bool InitSessionVk(reshade::api::effect_runtime *rt)
     DWORD ngx_code = 0;
     NVSDK_NGX_Result r = SafeNgxInit12(data_path, g.dev12, &ngx_code);
     if (ngx_code != 0)
-        Log("[feed] NVSDK_NGX_D3D12_Init raised exception 0x%08X (caught) -- another module hooking NGX in this "
-            "process faulted during init; the feed stays off for this run", ngx_code);
+        LogNgxInitFault(ngx_code);
     else
         Log("[feed] NVSDK_NGX_D3D12_Init -> 0x%08X (%s)", r, NgxResultName(r));
     if (NVSDK_NGX_FAILED(r))
@@ -5624,8 +5656,7 @@ static bool InitSessionGl(reshade::api::effect_runtime *rt)
     DWORD ngx_code = 0;
     NVSDK_NGX_Result r = SafeNgxInit12(data_path, g.dev12, &ngx_code);
     if (ngx_code != 0)
-        Log("[feed] NVSDK_NGX_D3D12_Init raised exception 0x%08X (caught) -- another module hooking NGX in this "
-            "process faulted during init; the feed stays off for this run", ngx_code);
+        LogNgxInitFault(ngx_code);
     else
         Log("[feed] NVSDK_NGX_D3D12_Init -> 0x%08X (%s)", r, NgxResultName(r));
     if (NVSDK_NGX_FAILED(r))

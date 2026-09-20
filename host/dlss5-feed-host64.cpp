@@ -76,6 +76,8 @@ static int  g_win_h = 1080;
 // default) -- pressed once for the user a few frames after the window is up, so the
 // neural consumer's panel is already open when they look at this window. Posted through
 // the message queue, which is where ReShade's WH_GETMESSAGE input hook reads keys.
+// 0 means the user unbound it ([INPUT] KeyOverlay=0,0,0,0, issue #118): nothing is posted
+// then, and neither the caption nor the banner offers a key that does nothing.
 static UINT g_overlay_key = VK_HOME;
 // Whether ReShade actually hooked D3D12CreateDevice in time to proxy this window's device
 // (see InitDisguise). False means there is no ReShade runtime here at all, so the overlay
@@ -84,7 +86,25 @@ static bool g_reshade_hooked = false;
 static int  g_pump_count  = 0;
 // The pump at which to post the overlay key, and again three pumps later. Startup opens the
 // overlay once at 90; tag 'O' (v9) re-arms it so the add-on's button can bring it back.
+// kOverlayNever skips the startup press only -- 'O' still re-arms it (see main, issue #118).
+static const int kOverlayNever = -1000000;
 static int  g_overlay_key_at = 90;
+
+// The cast panel: this window, drawn into the game by the 32-bit add-on (IPC v10, tag 'C').
+// Until v10 nothing here knew it was on screen -- the input it forwards arrives as ordinary
+// posted WM_* messages -- and a neural consumer that draws its own UI in this window had to
+// tail dlss5-feed.log to find out (issue #118). Kept here, logged on every change, and
+// republished as the registered window message below so a consumer can watch for it:
+//
+//     UINT m = RegisterWindowMessageW(L"DLSS5_FEED_CAST");
+//     ... wParam = 1 while the panel is on screen, 0 when it is not
+//     ... lParam = the scale it is drawn at, times 1000 (0 when hidden)
+//
+// It is posted to this window, so a consumer that subclasses it or runs a message hook sees
+// it; nothing outside this process is told.
+static bool  g_cast_on      = false;
+static float g_cast_scale   = 0.0f;
+static UINT  g_cast_msg     = 0;   // RegisterWindowMessage, resolved on the first 'C'
 
 // Present accounting (issue #15). The neural consumer wants one Present per evaluate; when
 // DWM holds every back buffer the per-evaluate Present cannot happen on the spot, and the
@@ -264,6 +284,15 @@ static void PrepareHostOverlay()
     GetPrivateProfileStringA("INPUT", "KeyOverlay", "36", buf, sizeof(buf), ini);
     const int k = atoi(buf);   // "36,0,0,0" -> 36; modifiers are ignored, ReShade's default has none
     if (k > 0 && k < 256) g_overlay_key = static_cast<UINT>(k);
+    // "0,0,0,0" is ReShade's way of writing an unbound key, and atoi gives 0 for it. The old
+    // guard read that as "unparsable, keep the default" and posted Home anyway -- harmless
+    // while ReShade ignores it, but the opposite of what the ini says (issue #118). Tell the
+    // two apart by the first character: a leading '0' is a real, deliberate zero.
+    else if (k == 0 && buf[0] == '0')
+    {
+        g_overlay_key = 0;
+        Log("[host] [INPUT] KeyOverlay=%s: ReShade's overlay key is unbound here, so none is posted", buf);
+    }
 
     RefitHostOverlay(ini, false);
 }
@@ -507,6 +536,10 @@ static void DetectStaleD3DCompiler()
     Log("[host] ###############################################################");
 }
 
+// Alex's Toolkit beside this exe. Like the other two consumers it owns a ReShade overlay
+// page, which is the one thing the overlay key is for (issue #118).
+static bool g_toolkit_present = false;
+
 static void DetectToolkitAddon()
 {
     char dir[MAX_PATH], path[MAX_PATH];
@@ -521,6 +554,7 @@ static void DetectToolkitAddon()
         Log("[host] Alex's Toolkit: not present -- DLSS 5 runs a single neural pass");
         return;
     }
+    g_toolkit_present = true;
     char ver[64] = "?";
     const DWORD size = GetFileSize(f, nullptr);
     DWORD got = 0;
@@ -1438,8 +1472,10 @@ static void InitBanner()
     // when OptiScaler is the neural consumer its menu is its own, on Insert, and nothing else
     // in this window says so.
     RECT r3 = { 0, S(305), W, S(345) };
-    DrawTextW(dc, g_reshade_hooked
+    DrawTextW(dc, g_reshade_hooked && g_overlay_key != 0
                   ? L"Press  Home  in this window to tune it  \x2022  closing only hides the window"
+                : g_reshade_hooked
+                  ? L"ReShade's overlay key is unbound  \x2022  closing only hides the window"
                   : L"ReShade did not attach here, so  Home  does nothing  \x2022  closing only hides the window",
               -1, &r3, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
     if (g_opti.present)
@@ -1728,14 +1764,20 @@ static bool PumpPresent(bool force = false)
     // up inside the same frame reads as never pressed). Only when the window is visible.
     if (g_show_window && h.hwnd != nullptr)
     {
+        // The count itself always runs: tag 'O' re-arms against it, and it is the only clock
+        // the idle paths have. Only the posting is conditional on a key existing (issue #118).
         ++g_pump_count;
-        const UINT scan = MapVirtualKeyW(g_overlay_key, MAPVK_VK_TO_VSC);
-        if (g_pump_count == g_overlay_key_at)
-            PostMessageW(h.hwnd, WM_KEYDOWN, g_overlay_key, 1 | (scan << 16));
-        else if (g_pump_count == g_overlay_key_at + 3)
+        if (g_overlay_key != 0)
         {
-            PostMessageW(h.hwnd, WM_KEYUP, g_overlay_key, 1 | (scan << 16) | (1u << 30) | (1u << 31));
-            Log("[host] opened ReShade's overlay (key %u) so the neural consumer's panel is in view", g_overlay_key);
+            const UINT scan = MapVirtualKeyW(g_overlay_key, MAPVK_VK_TO_VSC);
+            if (g_pump_count == g_overlay_key_at)
+                PostMessageW(h.hwnd, WM_KEYDOWN, g_overlay_key, 1 | (scan << 16));
+            else if (g_pump_count == g_overlay_key_at + 3)
+            {
+                PostMessageW(h.hwnd, WM_KEYUP, g_overlay_key, 1 | (scan << 16) | (1u << 30) | (1u << 31));
+                Log("[host] opened ReShade's overlay (key %u) so the neural consumer's panel is in view",
+                    g_overlay_key);
+            }
         }
     }
 
@@ -1998,11 +2040,18 @@ static bool InitDisguise()
     // The caption is the one line of this window a user sees on the taskbar, so it carries the
     // same advice as the banner -- including OptiScaler's Insert, which is the only door to a
     // tuning UI when OptiScaler is the consumer and ReShade lost the hook race.
+    // One state more than there used to be: ReShade is here but the user unbound its overlay
+    // key, so "press Home" would be wrong (issue #118).
+    const bool unbound = g_reshade_hooked && g_overlay_key == 0;
     const wchar_t *caption =
         !g_reshade_hooked && g_opti.present
             ? L"DLSS 5 Feed host - ReShade did not attach; press Insert HERE for OptiScaler's menu"
         : !g_reshade_hooked
             ? L"DLSS 5 Feed host - ReShade did not attach to this window; Home does nothing here"
+        : unbound && g_opti.present
+            ? L"DLSS 5 Feed host - press Insert HERE for OptiScaler's menu"
+        : unbound
+            ? L"DLSS 5 Feed host - ReShade's overlay key is unbound in this window's ReShade.ini"
         : g_opti.present
             ? L"DLSS 5 Feed host - press Home HERE to tune DLSS 5, or Insert for OptiScaler's menu"
             : L"DLSS 5 Feed host - press Home HERE to tune DLSS 5 neural rendering";
@@ -3243,6 +3292,30 @@ static int Serve(DWORD game_pid)
             WriteFull(pipe, &back, sizeof(back));
             if (!ok && DeviceRemoved("a rebuild")) break;   // the ack went out; retrying here is pointless
         }
+        else if (tag == 'C')
+        {
+            // v10: where the cast panel is on screen in the game. Nothing here acts on the
+            // rectangle -- it is in the GAME's client pixels, which this process cannot draw
+            // into -- but the scale is what a consumer sizing its own UI needs, and "is it
+            // even visible" is what every one of them was missing (issue #118).
+            FeedCastMsg cm = {};
+            if (!ReadFull(pipe, &cm, sizeof(cm))) break;
+            g_cast_on    = cm.shown != 0;
+            g_cast_scale = g_cast_on ? cm.scale : 0.0f;
+            if (g_cast_on)
+                Log("[host] the cast panel is on screen in the game at %ld,%ld-%ld,%ld (scale %.2f, corner %u); "
+                    "this window is what it shows", static_cast<long>(cm.left), static_cast<long>(cm.top),
+                    static_cast<long>(cm.right), static_cast<long>(cm.bottom), cm.scale, cm.anchor);
+            else
+                Log("[host] the cast panel is no longer on screen in the game");
+            if (h.hwnd != nullptr)
+            {
+                if (g_cast_msg == 0) g_cast_msg = RegisterWindowMessageW(L"DLSS5_FEED_CAST");
+                if (g_cast_msg != 0)
+                    PostMessageW(h.hwnd, g_cast_msg, g_cast_on ? 1u : 0u,
+                                 static_cast<LPARAM>(static_cast<long>(g_cast_scale * 1000.0f + 0.5f)));
+            }
+        }
         else if (tag == 'W')
         {
             // v8: the add-on's window sliders, applied live. Handled here rather than by
@@ -3274,10 +3347,17 @@ static int Serve(DWORD game_pid)
             // v9: the add-on's "Show ReShade in Host" button. Re-arm the startup sequence
             // rather than posting here: the two edges have to land in different frames of
             // THIS process, and the pump is what counts them.
-            g_overlay_key_at = g_pump_count + 2;
-            // The key toggles, so this shows the overlay only if it is currently hidden. The
-            // add-on tracks that and labels its button show/hide; nothing here can query ReShade.
-            Log("[host] the game asked to toggle ReShade's overlay: posting key %u to this window", g_overlay_key);
+            if (g_overlay_key == 0)
+                Log("[host] the game asked to toggle ReShade's overlay, but [INPUT] KeyOverlay is unbound "
+                    "in the host's ReShade.ini: nothing posted");
+            else
+            {
+                g_overlay_key_at = g_pump_count + 2;
+                // The key toggles, so this shows the overlay only if it is currently hidden. The
+                // add-on tracks that and labels its button show/hide; nothing here can query ReShade.
+                Log("[host] the game asked to toggle ReShade's overlay: posting key %u to this window",
+                    g_overlay_key);
+            }
         }
         else if (tag == 'F')
         {
@@ -3698,6 +3778,18 @@ int main(int argc, char **argv)
     DetectOptiScaler();     // after both: it warns when either is beside it
     DetectStaleD3DCompiler();
     PrepareHostOverlay();   // edits ReShade.ini, so also BEFORE ReShade loads (InitDisguise)
+    // The startup press exists to bring the consumer's tuning panel into view. OptiScaler's
+    // panel is its own window on Insert, not a ReShade add-on page, so with OptiScaler as the
+    // only consumer there is nothing for it to open (issue #118). Only the STARTUP press is
+    // skipped: the key stays known, Home pressed by hand still works, and so does the add-on's
+    // "Toggle ReShade in host" button (tag 'O'). Here rather than in PrepareHostOverlay because
+    // this is where all the detections are in scope.
+    if (g_overlay_key != 0 && g_opti.present && !g_renodx_present && !g_chicken_present && !g_toolkit_present)
+    {
+        g_overlay_key_at = kOverlayNever;
+        Log("[host] OptiScaler is the only neural consumer here and its menu is its own window (Insert), "
+            "so ReShade's overlay is not opened at startup; Home in this window still opens it");
+    }
 
     // Both failures used to `return 1` straight out, skipping the tail below -- and a failed
     // NGX init is exactly the case where ReShade is already loaded and its teardown is the

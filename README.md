@@ -1110,9 +1110,26 @@ if you prefer editing the file directly:
 | `host_window` | 0 | **32-bit games only.** 0 keeps the helper's window behind the game, off the taskbar, and lets the overlay's "Show the DLSS 5 panel in-game" button cast its tuning panel into the game window; 1 gives the helper its own visible window instead (press Home there); 2 starts it with no window at all (`--hide`: no in-game panel, no host window, the feed itself unaffected). Read when the helper is started. **At 0 the window is still created, shown and presented on every evaluate** — only its z-order and window style differ — so 0 vs 1 is not an A/B for "does the helper's presenting cost anything"; 2 is. **Exclusive fullscreen:** at 0, if the game's swapchain is exclusive fullscreen when the helper starts, the add-on passes `--hide` by itself and says so in the log. Three 32-bit games froze the instant the helper's window appeared under their fullscreen swapchain (#109, #99, #77), and the desktop compositor cannot draw the cast panel over exclusive fullscreen anyway. Run the game borderless to get the panel. **3** is 0 without that rule: the window stays behind the game and is never turned into `--hide`. It is for wrappers whose swapchain reports fullscreen over what is really a borderless window -- dgVoodoo does this whatever its own `FullScreenMode` says (#118) -- and the overlay offers it as a checkbox when it applies. Do not use 3 on a game that is genuinely exclusive fullscreen. |
 | `host_gpu_priority` | 0 | **32-bit games only.** `1` asks the GPU scheduler to favour the helper process (`D3DKMTSetProcessSchedulingPriorityClass`, realtime class), passed to it as `--gpu-priority` when it starts. Worth trying only for periodic multi-second stalls that persist with everything else at defaults — reported on GTA IV under DXVK, where the reporter had already proved it with Process Lasso. **Off by default on purpose:** realtime GPU priority can starve the very game it is meant to help, and the call needs privilege that may not be granted. The helper logs which of the two happened on every start. |
 | `cast_key` | 0 | **32-bit games only.** Virtual-key code that shows/hides the cast DLSS 5 panel in-game; 0 = none. Set it from the overlay page with "Set key" rather than by hand. |
+| `cast_mods` | 0 | **32-bit games only.** Modifiers that must be held with `cast_key`: 1 = Alt, 2 = Ctrl, 4 = Shift, added together. Hold them while you press the key under "Set key" and they are saved with it. **The match is exact**, so the default 0 means the bare key and `Alt+Shift+<key>` no longer toggles the panel as well — which is what lets another tool own that combination (#118). Before 1.16.0-beta.6 every combination containing the key fired. |
 | `cast_scale` | 100 | **32-bit games only.** Size of the cast panel, 25..300 % of the largest size that fits the game window (above 100 % it may run past the window's edges). Also on the overlay as "Panel size". |
 | `cast_mode` | 0 | **32-bit games only.** How the cast panel is drawn: 0 = a desktop-compositor thumbnail of the helper's window (windowed / borderless games, any API); 1 = a shared copy of the helper's frame drawn by the game's ReShade or blitted onto its backbuffer (works in exclusive fullscreen; D3D11, OpenGL and Vulkan). The two overlay buttons set it. |
 | `cast_anchor` | 1 | **32-bit games only.** Which corner of the game window the cast panel sits in: 0 top-left, 1 top-right, 2 bottom-left, 3 bottom-right. Before 0.14.0-beta.4 it was always the top-right and there was no way to move it. Also on the overlay as "Panel corner". |
+
+**For neural consumers that draw their own UI in the helper window.** The cast draws the helper's
+window into the game, and what reaches the helper from it is ordinary posted `WM_*` input that says
+nothing about where it came from -- so a consumer with its own window (OptiScaler's menu is one, not
+a ReShade page) could not tell whether it was on screen, and had to tail `dlss5-feed.log` to find out
+(#118). Since 1.16.0-beta.6 the helper posts a registered window message to its own window on every
+change:
+
+```c
+UINT m = RegisterWindowMessageW(L"DLSS5_FEED_CAST");   // wParam: 1 = the panel is on screen, 0 = it is not
+                                                       // lParam: the scale it is drawn at, x1000 (0 when hidden)
+```
+
+Subclass the helper window or run a message hook to see it; nothing outside the helper process is
+told. `dlss5-feed-host.log` carries the same state in words, with the destination rectangle in the
+game's client pixels and the corner it is anchored to.
 
 Two more live in a **different file** -- `[DLSS5Host] WindowWidth` and `WindowHeight` in
 `host64\ReShade.ini`, because the helper's own ReShade reads them when it starts. They size the
